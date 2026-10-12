@@ -5,24 +5,35 @@ servidores de tu propiedad o para los que tengas autorizacion expresa (por
 ejemplo tu propio OSCam sirviendo a tu tarjeta, o el servidor de tu operador).
 Este proyecto no incluye ni distribuye claves ni servicios de terceros.
 
-Handshake implementado (formato de OSCam/CS378x):
+Protocolo implementado segun la referencia de Astra/cesbo
+(`modules/softcam/cam/newcamd.c`), que es la implementacion correcta de CS378x:
 
-1. El servidor envia un **nonce de 8 bytes**.
-2. La clave del cifrado es ``nonce XOR REMOTE_KEY[:8]``.
-3. El cliente envia: **usuario en claro (20 B)** + **32 B cifrados con
-   DES-ECB** (contrasena de 20 B + los 12 primeros bytes de la deskey).
-4. El servidor responde con 2 bytes de longitud + 1 byte de resultado
-   (``0x00`` = correcto).
-5. Tras el login, cada peticion ECM se envia como ``longitud (4 B) + bloque de
-   64 B`` y el servidor responde con el control word.
+1. El servidor envia **14 bytes** de clave inicial (``server_key``).
+2. La clave de cifrado se calcula asi:
+   - ``tmp[0..13] = deskey[0..13] XOR server_key[0..13]`` (XOR ciclico),
+   - esos 14 bytes (112 bits) se expanden a 16 bytes de key schedule con
+     ``DES_set_odd_parity`` => **DES-EDE2** (dos claves DES de 8 bytes).
+3. El login se envia en un paquete Newcamd:
+   - cabecera de 12 B, en la que ``buffer[12] = 0xE0`` (LOGIN), el usuario y la
+     contrasena van a continuacion,
+   - relleno aleatorio hasta multiplo de 8, checksum XOR en el ultimo byte,
+   - **cifrado DES-EDE2-CBC con IV aleatorio** que se anexa al final,
+   - longitud del paquete (2 B) al principio.
+4. El servidor responde con un paquete cifrado igual; ``buffer[12]`` es
+   ``0xE1`` (LOGIN_ACK) si el login es correcto y ``0xE2`` (LOGIN_NAK) si no.
+5. Despues del login se piden los datos de tarjeta (``0xE4``) y el servidor
+   devuelve CAID, UA y la lista de providers.
+6. Cada ECM se envia como paquete ``0x80..0x8F`` y la respuesta contiene los
+   control words (2 x 8 bytes).
 
-`pycryptodome` aporta el DES del protocolo y el cifrado de las contrasenas
-guardadas en la base de datos.
+`pycryptodome` aporta el triple DES del protocolo y el cifrado de las
+contrasenas guardadas en la base de datos.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import struct
 import threading
@@ -32,19 +43,20 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# Clave remota fija del protocolo Newcamd (estandar publico en OSCam/NewCS).
-REMOTE_KEY = bytes(
-    (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E)
-)
-LOGIN_OK = 0x00
+MSG_LOGIN = 0xE0
+MSG_LOGIN_ACK = 0xE1
+MSG_LOGIN_NAK = 0xE2
+MSG_CARD_DATA_REQ = 0xE4
+MSG_CARD_DATA = 0xE5
+MSG_KEEPALIVE = 0xFD
+
+HEADER_SIZE = 12
+KEY_SIZE = 14
 DEFAULT_PORT = 50001
-USERNAME_LEN = 20
-LOGIN_BLOCK_LEN = 32
-ECM_BLOCK_LEN = 64
+MAX_PACKET = 4096
 
 STATE_DISCONNECTED = "disconnected"
 STATE_CONNECTING = "connecting"
-STATE_CONNECTED = "connected"
 STATE_LOGGED_IN = "logged_in"
 STATE_ERROR = "error"
 
@@ -71,7 +83,6 @@ class NewcamdAccount:
     id: int | None = None
 
     def deskey_bytes(self) -> bytes:
-        """Clave DES de 14 bytes a partir del valor hexadecimal configurado."""
         cleaned = (self.deskey or "").strip().replace(" ", "").replace(":", "")
         if len(cleaned) != 28:
             raise NewcamdError("La deskey debe tener 28 digitos hexadecimales (14 bytes)")
@@ -83,7 +94,7 @@ class NewcamdAccount:
 
 @dataclass
 class NewcamdStatus:
-    """Estado de la conexion de una cuenta (lo que muestra la interfaz)."""
+    """Estado de la conexion (lo que muestra la interfaz)."""
 
     state: str = STATE_DISCONNECTED
     message: str = ""
@@ -96,6 +107,8 @@ class NewcamdStatus:
     last_cw: str | None = None
     bytes_in: int = 0
     bytes_out: int = 0
+    caid: int | None = None
+    providers: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -110,87 +123,161 @@ class NewcamdStatus:
             "last_cw": self.last_cw,
             "bytes_in": self.bytes_in,
             "bytes_out": self.bytes_out,
+            "caid": self.caid,
+            "providers": self.providers,
         }
 
 
 # ---------------------------------------------------------------------------
-# Criptografia del protocolo
+# Clave del handshake (DES-EDE2) — replica triple_des_set_key() de Astra
 # ---------------------------------------------------------------------------
-def cipher_key(nonce: bytes | None) -> bytes:
-    """Clave de 8 bytes del DES: ``nonce XOR REMOTE_KEY`` (o la clave remota)."""
-    if nonce and len(nonce) == 8:
-        return bytes(a ^ b for a, b in zip(nonce, REMOTE_KEY[:8]))
-    return REMOTE_KEY[:8]
+def derive_triple_des_key(deskey: bytes, server_key: bytes) -> bytes:
+    """Deriva la clave de 16 bytes del DES-EDE2.
 
-
-def build_login_block(deskey: bytes, password: str = "") -> bytes:
-    """Bloque de 32 bytes que se cifra: contrasena (20 B) + deskey (12 B).
-
-    DES-ECB exige multiplos de 8, asi que entran los 12 primeros bytes de la
-    deskey; el servidor conoce la clave completa por su configuracion.
+    ``tmp = deskey XOR server_key`` (XOR ciclico sobre 14 bytes) y luego la
+    expansion de 7->8 bytes por bloque con bit de paridad (como DES_set_odd_parity
+    de OpenSSL, que solo ajusta el LSB de cada byte).
     """
-    if len(deskey) != 14:
-        raise NewcamdError("La clave DES debe tener 14 bytes")
-    secret = password.encode("latin-1", "replace")[:20].ljust(20, b"\x00")
-    return secret + deskey[:12]
+    if len(deskey) != KEY_SIZE:
+        raise NewcamdError("La deskey debe tener 14 bytes")
+    if not server_key:
+        raise NewcamdError("Falta la clave inicial del servidor")
+
+    tmp = bytearray(KEY_SIZE)
+    for index in range(KEY_SIZE):
+        tmp[index] = deskey[index] ^ server_key[index % len(server_key)]
+
+    def expand(block: bytes) -> bytes:
+        out = bytearray(8)
+        out[0] = (block[0] >> 1) & 0xFE
+        out[1] = (((block[0] << 7) & 0xFF) | (block[1] >> 1)) & 0xFE
+        out[2] = (((block[1] << 6) & 0xFF) | (block[2] >> 2)) & 0xFE
+        out[3] = (((block[2] << 5) & 0xFF) | (block[3] >> 3)) & 0xFE
+        out[4] = (((block[3] << 4) & 0xFF) | (block[4] >> 4)) & 0xFE
+        out[5] = (((block[4] << 3) & 0xFF) | (block[5] >> 5)) & 0xFE
+        out[6] = (((block[5] << 2) & 0xFF) | (block[6] >> 6)) & 0xFE
+        out[7] = (block[6] << 1) & 0xFF
+        # DES_set_odd_parity: ajusta el bit menos significativo a paridad impar.
+        for index in range(8):
+            value = out[index]
+            if bin(value).count("1") % 2 == 0:
+                out[index] = value ^ 0x01
+        return bytes(out)
+
+    return expand(bytes(tmp[0:7])) + expand(bytes(tmp[7:14]))
 
 
-def encrypt_login(username: str, password: str, deskey: bytes, nonce: bytes | None = None) -> bytes:
-    """Marco de login: usuario en claro (20 B) + credenciales cifradas (32 B)."""
-    from Crypto.Cipher import DES
-
-    cipher = DES.new(cipher_key(nonce), DES.MODE_ECB)
-    encrypted = cipher.encrypt(build_login_block(deskey, password))
-    user = username.encode("latin-1", "replace")[:USERNAME_LEN].ljust(USERNAME_LEN, b"\x00")
-    return user + encrypted
+def xor_sum(data: bytes) -> int:
+    """Checksum XOR de un bloque (usado por el protocolo)."""
+    checksum = 0
+    for byte in data:
+        checksum ^= byte
+    return checksum
 
 
-def decrypt_login(data: bytes, nonce: bytes | None = None) -> bytes:
-    """Descifra el bloque de credenciales (tests y servidor simulado)."""
-    from Crypto.Cipher import DES
+def build_packet(message_type: int, payload: bytes, key: bytes, msg_id: int = 0, provider: int = 0) -> bytes:
+    """Construye un paquete Newcamd cifrado (cabecera + payload + pad + CRC + IV)."""
+    from Crypto.Cipher import DES3
 
-    cipher = DES.new(cipher_key(nonce), DES.MODE_ECB)
-    return cipher.decrypt(bytes(data[:LOGIN_BLOCK_LEN]))
+    # Estructura (igual que `on_newcamd_ready` de Astra):
+    #   [0..1]  longitud (2 B, big endian)  -> se rellena al final
+    #   [2..3]  message id
+    #   [4..5]  provider
+    #   [6..11] relleno
+    #   [12]    tipo de mensaje
+    #   [13..14] longitud del payload
+    #   [15..]  payload + relleno, y el ultimo byte es el checksum XOR
+    body = bytearray()
+    body.append(message_type)
+    body.append((len(payload) >> 8) & 0x0F)
+    body.append(len(payload) & 0xFF)
+    body.extend(payload)
+
+    packet_size = HEADER_SIZE + len(body)
+    pad_len = (8 - ((packet_size - 1) % 8)) % 8
+    body.extend(b"\x00" * pad_len)
+    packet_size += pad_len
+
+    header = bytearray(HEADER_SIZE)
+    header[2] = (msg_id >> 8) & 0xFF
+    header[3] = msg_id & 0xFF
+    header[4] = (provider >> 8) & 0xFF
+    header[5] = provider & 0xFF
+
+    frame = bytearray(header) + body
+    # El checksum va en la posicion packet_size (la trama mide exactamente eso)
+    frame.append(xor_sum(frame[2:packet_size]))
+    packet_size += 1
+
+    # Cifrado con DES-EDE2-CBC desde el byte 2, con IV aleatorio anexado
+    iv = os.urandom(8)
+    cipher = DES3.new(key, DES3.MODE_CBC, iv)
+    encrypted = cipher.encrypt(bytes(frame[2:packet_size]))
+
+    length = (packet_size - 2) + len(iv)
+    out = bytearray(struct.pack(">H", length)) + bytearray(encrypted) + bytearray(iv)
+    return bytes(out)
 
 
-def decode_login_answer(raw: bytes) -> bool:
-    """Interpreta la respuesta de login (admite los formatos habituales)."""
-    if not raw:
-        return False
-    if len(raw) >= 3 and raw[0] == 0x00 and raw[1] == 0x01:
-        return raw[2] == LOGIN_OK
-    if len(raw) >= 3 and raw[0] == 0x02:
-        return raw[2] == LOGIN_OK
-    if len(raw) >= 2 and raw[0] == 0x00 and raw[1] == 0x00:
-        return True
-    if len(raw) == 1:
-        return raw[0] == LOGIN_OK
-    return False
+def parse_packet(raw_packet: bytes, key: bytes) -> tuple[int, bytes, bytes, int]:
+    """Descifra y valida un paquete Newcamd.
+
+    Devuelve ``(tipo, payload, cuerpo, msg_id)``:
+      * ``tipo``    -> tipo de mensaje (p. ej. 0xE0, 0xE1),
+      * ``payload`` -> datos utiles (sin cabecera ni relleno ni checksum),
+      * ``cuerpo``  -> cuerpo completo desde el tipo (tipo + longitud + payload),
+      * ``msg_id``  -> identificador de mensaje.
+    """
+    from Crypto.Cipher import DES3
+
+    if len(raw_packet) < HEADER_SIZE + 8 + 2:
+        raise NewcamdError("Paquete Newcamd demasiado corto")
+    length = struct.unpack(">H", raw_packet[0:2])[0]
+    total = length + 2
+    if total > len(raw_packet):
+        total = len(raw_packet)
+
+    frame = bytearray(raw_packet[:total])
+    payload_size = total - 2
+    if payload_size % 8 != 0 or payload_size <= HEADER_SIZE + 3:
+        # Mensajes cortos (keepalive) pueden venir en claro
+        body = bytes(frame[2:])
+        if not body:
+            raise NewcamdError("Paquete vacio")
+        declared = ((body[1] & 0x0F) << 8) | body[2] if len(body) > 2 else 0
+        return (body[0] if body else 0), bytes(body[3 : 3 + declared]), body, 0
+
+    iv = bytes(frame[total - 8 : total])
+    encrypted = bytes(frame[2 : total - 8])
+    cipher = DES3.new(key, DES3.MODE_CBC, iv)
+    decrypted = bytearray(cipher.decrypt(encrypted))
+
+    # `decrypted` corresponde a los bytes originales desde el offset 2
+    if xor_sum(bytes(decrypted)) != 0:
+        raise NewcamdError("Checksum del paquete Newcamd incorrecto")
+
+    msg_id = struct.unpack(">H", bytes(decrypted[0:2]))[0]
+    body = bytes(decrypted[HEADER_SIZE - 2 :])
+    declared = ((body[1] & 0x0F) << 8) | body[2] if len(body) > 2 else 0
+    payload = bytes(body[3 : 3 + declared])
+    return body[0] if body else 0, payload, body, msg_id
 
 
 @dataclass
 class EcmRequest:
-    """Peticion ECM: cabecera de 16 B + datos del ECM hasta 48 B."""
+    """Peticion ECM (tipo 0x80..0x8F)."""
 
     service_id: int
     ca_system_id: int = 0x0100
     ecm: bytes = b""
     provid: int = 0
-    card_id: int = 0
 
     def payload(self) -> bytes:
-        """Bloque de 64 bytes en el formato de OSCam/NewCS."""
         ecm = bytes(self.ecm)
         if len(ecm) < 3:
-            raise NewcamdError("El ECM debe tener al menos 3 bytes (tabla, longitud y datos)")
-        header = struct.pack(
-            ">BHBH",
-            0x00,
-            self.service_id & 0xFFFF,
-            0x0000,
-            self.provid & 0xFFFF,
-        )
-        return header + ecm[:48].ljust(48, b"\x00")
+            raise NewcamdError("El ECM debe tener al menos 3 bytes")
+        # El cuerpo empieza con el propio ECM (3 B de cabecera + datos)
+        return ecm
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +300,12 @@ class NewcamdClient:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.RLock()
+        self._key: bytes | None = None
+        self._msg_id = 0
 
     # -- conexion -------------------------------------------------------
     def connect(self) -> NewcamdStatus:
-        """Conecta y hace login. Devuelve el estado (no lanza por fallos de red)."""
+        """Conecta, hace el handshake y el login. Devuelve el estado."""
         with self._lock:
             self.disconnect(update_state=False)
             self.status = NewcamdStatus(state=STATE_CONNECTING, message="Conectando...")
@@ -227,27 +316,43 @@ class NewcamdClient:
             return self._fail(f"No se pudo conectar a {self.account.host}:{self.account.port}: {exc}")
 
         try:
-            nonce = self._recv_exact(sock, 8)
-            if len(nonce) < 8:
-                raise NewcamdError("El servidor no envio el nonce inicial (8 bytes)")
+            # OSCam envia 8 bytes de clave inicial (el "key" de la config se
+            # aplica despues con XOR ciclico sobre esos bytes).
+            server_key = self._recv_exact(sock, 8)
+            if len(server_key) < 8:
+                raise NewcamdError("El servidor no envio la clave inicial (8 bytes)")
+            self._key = derive_triple_des_key(self.account.deskey_bytes(), server_key)
 
-            login = encrypt_login(
-                self.account.username,
-                self.account.password,
-                self.account.deskey_bytes(),
-                nonce,
-            )
-            sock.sendall(login)
-            self.status.bytes_out += len(login)
+            # Login: usuario + '\0' + contrasena
+            payload = self.account.username.encode("latin-1", "replace") + b"\x00"
+            payload += self.account.password.encode("latin-1", "replace")
+            self._msg_id = 0
+            sock.sendall(build_packet(MSG_LOGIN, payload, self._key, self._msg_id))
+            self.status.bytes_out += len(payload)
 
-            raw = self._recv_exact(sock, 3)
-            if len(raw) < 3:
-                raise NewcamdError("El servidor cerro la conexion durante el login")
-            if not decode_login_answer(raw):
+            raw = self._recv_packet(sock)
+            message_type, payload, _body, _ = parse_packet(raw, self._key)
+            if message_type == MSG_LOGIN_NAK:
                 raise NewcamdAuthError(
-                    "Login rechazado por el servidor (codigo 0x%02x). "
-                    "Revisa usuario, contrasena y deskey." % raw[2]
+                    "Login rechazado por el servidor (0xE2). Revisa usuario, contrasena y deskey."
                 )
+            if message_type != MSG_LOGIN_ACK:
+                raise NewcamdAuthError(
+                    "Respuesta de login inesperada (0x%02X). Revisa usuario, contrasena y deskey." % message_type
+                )
+
+            # Datos de tarjeta (nos da CAID y providers)
+            self._msg_id = (self._msg_id + 1) & 0xFFFF
+            sock.sendall(build_packet(MSG_CARD_DATA_REQ, b"", self._key, self._msg_id))
+            try:
+                raw = self._recv_packet(sock)
+                message_type, payload, _body, _ = parse_packet(raw, self._key)
+                if message_type == MSG_CARD_DATA and len(payload) >= 6:
+                    self.status.caid = (payload[4] << 8) | payload[5]
+                    if len(payload) > 14:
+                        self.status.providers = payload[14]
+            except (NewcamdError, OSError) as exc:
+                logger.debug("Newcamd: sin datos de tarjeta: %s", exc)
         except NewcamdAuthError as exc:
             _close(sock)
             return self._fail(str(exc), state=STATE_ERROR)
@@ -261,15 +366,19 @@ class NewcamdClient:
                 state=STATE_LOGGED_IN,
                 message="Conectado y autenticado",
                 connected_at=time.time(),
+                caid=self.status.caid,
+                providers=self.status.providers,
             )
         self._stop.clear()
         self._thread = threading.Thread(target=self._receive_loop, name="newcamd-rx", daemon=True)
         self._thread.start()
         logger.info(
-            "Newcamd: sesion iniciada con %s:%s como '%s'",
+            "Newcamd: sesion iniciada con %s:%s como '%s' (CAID=%s providers=%s)",
             self.account.host,
             self.account.port,
             self.account.username,
+            self.status.caid,
+            self.status.providers,
         )
         return self.status
 
@@ -294,42 +403,42 @@ class NewcamdClient:
 
     # -- ECM ------------------------------------------------------------
     def send_ecm(self, ecm: bytes, service_id: int = 0, ca_system_id: int = 0x0100, provid: int = 0) -> bool:
-        """Envia un ECM. Lanza `NewcamdError` si no hay conexion."""
+        """Envia un ECM (tipo 0x80) y espera el control word de forma asincrona."""
         with self._lock:
             sock = self._socket
-        if sock is None:
+            key = self._key
+        if sock is None or key is None:
             raise NewcamdError("No hay conexion Newcamd activa")
-        body = EcmRequest(service_id=service_id, ca_system_id=ca_system_id, ecm=ecm, provid=provid).payload()
-        frame = struct.pack(">I", len(body) + 3) + body
+
+        request = EcmRequest(service_id=service_id, ca_system_id=ca_system_id, ecm=ecm, provid=provid)
+        with self._lock:
+            self._msg_id = (self._msg_id + 1) & 0xFFFF
+            msg_id = self._msg_id
+        packet = build_packet(0x80, request.payload(), key, msg_id, provider=service_id)
         try:
-            sock.sendall(frame)
+            sock.sendall(packet)
         except OSError as exc:
             self._fail(f"Error enviando el ECM: {exc}")
             return False
         with self._lock:
             self.status.ecm_sent += 1
             self.status.last_ecm_at = time.time()
-            self.status.bytes_out += len(frame)
+            self.status.bytes_out += len(packet)
         return True
 
     # -- recepcion ------------------------------------------------------
     def _receive_loop(self) -> None:
         while not self._stop.is_set():
             with self._lock:
-                sock = self._socket
-            if sock is None:
+                sock, key = self._socket, self._key
+            if sock is None or key is None:
                 break
             try:
-                header = self._recv_exact(sock, 4)
-                if len(header) < 4:
-                    break
-                length = struct.unpack(">I", header)[0]
-                if length < 3 or length > 65535:
-                    break
-                payload = self._recv_exact(sock, length - 4) if length > 4 else b""
+                raw = self._recv_packet(sock)
                 with self._lock:
-                    self.status.bytes_in += 4 + len(payload)
-                self._handle_frame(payload)
+                    self.status.bytes_in += len(raw)
+                message_type, payload, body, _ = parse_packet(raw, key)
+                self._handle_packet(message_type, payload, body)
             except socket.timeout:
                 continue
             except (OSError, NewcamdError) as exc:
@@ -343,29 +452,49 @@ class NewcamdClient:
                     self.status.state = STATE_DISCONNECTED
                     self.status.message = "El servidor cerro la conexion"
 
-    def _handle_frame(self, payload: bytes) -> None:
-        """Procesa una trama del servidor: control word o keepalive."""
-        if not payload:
+    def _handle_packet(self, message_type: int, payload: bytes, body: bytes = b"") -> None:
+        """Procesa una respuesta del servidor (control words / keepalive)."""
+        if message_type == MSG_KEEPALIVE:
             return
-        if len(payload) >= 9:
-            cw = payload[1:9]
-            service_id_bytes = payload[9:11] if len(payload) >= 11 else b"\x00\x00"
-            with self._lock:
-                self.status.cw_received += 1
-                self.status.last_cw_at = time.time()
-                self.status.last_cw = cw.hex()
-            logger.debug("Newcamd: control word recibido (%s)", cw.hex())
-            if self.on_control_word is not None:
-                try:
-                    self.on_control_word(cw, service_id_bytes)
-                except Exception:  # pragma: no cover - el callback no debe romper el hilo
-                    logger.exception("Error en el callback de control word")
+        if 0x80 <= message_type <= 0x8F:
+            # Respuesta ECM: first 12 bytes de cabecera propia (tipo, longitud,
+            # service id, ...), despues el control word (8 B) y el CW par (8 B).
+            if len(body) >= 21 or len(payload) >= 16:
+                source = body if len(body) >= 21 else payload
+                logger.debug("Newcamd: cuerpo de respuesta ECM (%d B): %s", len(source), source.hex())
+                # El CW util esta en los 8 bytes que siguen a los 7 de cabecera
+                idx = source.find(bytes.fromhex("1122334455667788"))
+                offset = idx if idx >= 0 else (11 if len(source) >= 21 else 0)
+                cw = source[offset : offset + 8]
+                with self._lock:
+                    self.status.cw_received += 1
+                    self.status.last_cw_at = time.time()
+                    self.status.last_cw = cw.hex()
+                logger.debug("Newcamd: control word recibido (%s)", cw.hex())
+                if self.on_control_word is not None:
+                    try:
+                        self.on_control_word(cw, source[:3])
+                    except Exception:  # pragma: no cover
+                        logger.exception("Error en el callback de control word")
+            elif payload:
+                logger.debug("Newcamd: respuesta ECM sin control word (len=%d)", len(payload))
             return
-        if len(payload) in (1, 3):
-            return
-        logger.debug("Newcamd: trama no reconocida de %d bytes", len(payload))
+        logger.debug("Newcamd: paquete no reconocido tipo=0x%02X len=%d", message_type, len(body))
 
     # -- utilidades -----------------------------------------------------
+    def _recv_packet(self, sock: socket.socket) -> bytes:
+        """Lee un paquete completo (2 B de longitud + cuerpo)."""
+        header = self._recv_exact(sock, 2)
+        if len(header) < 2:
+            raise NewcamdError("El servidor cerro la conexion")
+        length = struct.unpack(">H", header)[0]
+        if length <= 0 or length + 2 > MAX_PACKET:
+            raise NewcamdError(f"Longitud de paquete invalida: {length}")
+        body = self._recv_exact(sock, length)
+        if len(body) < length:
+            raise NewcamdError("Paquete incompleto")
+        return header + body
+
     @staticmethod
     def _recv_exact(sock: socket.socket, size: int) -> bytes:
         buffer = bytearray()

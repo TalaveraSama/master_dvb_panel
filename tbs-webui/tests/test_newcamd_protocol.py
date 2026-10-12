@@ -1,18 +1,18 @@
-"""Tests del cliente Newcamd contra un servidor simulado.
+"""Tests del cliente Newcamd (protocolo CS378x) contra un servidor simulado.
 
-El servidor de prueba implementa el protocolo real de OSCam:
+El servidor simulado implementa el protocolo real de Astra/OSCam:
 
-1. Al conectar envía un **nonce de 8 bytes**.
-2. Recibe el login: usuario en claro (20 B) + credenciales cifradas (32 B) con
-   ``DES-ECB(key=nonce XOR REMOTE_KEY)``.
-3. Responde ``\\x00\\x01\\x00`` (longitud 1 + resultado 0 = OK).
-4. Tras el login responde a los ECM con el control word.
+1. Envia 14 bytes de clave inicial.
+2. Deriva la clave DES-EDE2 con `derive_triple_des_key`.
+3. Descifra el login (DES-EDE2-CBC), valida usuario/contrasena y responde 0xE1
+   (ACK) o 0xE2 (NAK).
+4. Responde a CARD_DATA_REQ con CAID y providers.
+5. Responde a los ECM (0x80) con los control words.
 """
 
 from __future__ import annotations
 
 import socket
-import struct
 import threading
 import time
 
@@ -20,25 +20,30 @@ import pytest
 
 from app.config import get_settings
 from app.services.newcamd_client import (
-    REMOTE_KEY,
+    MSG_CARD_DATA,
+    MSG_CARD_DATA_REQ,
+    MSG_LOGIN,
+    MSG_LOGIN_ACK,
+    MSG_LOGIN_NAK,
     NewcamdAccount,
     NewcamdClient,
     NewcamdError,
-    build_login_block,
-    decrypt_login,
-    encrypt_login,
+    build_packet,
+    derive_triple_des_key,
+    parse_packet,
+    xor_sum,
 )
 from app.services.newcamd_manager import decrypt_password, encrypt_password
 
 USER = "astra"
 PASSWORD = "astra"
 DESKEY = bytes.fromhex("0102030405060708091011121314")
-NONCE = bytes.fromhex("0011223344556677")
+SERVER_KEY = bytes.fromhex("0011223344556677")
 CW = bytes.fromhex("1122334455667788")
 
 
 class FakeNewcamdServer(threading.Thread):
-    """Servidor Newcamd mínimo (protocolo real) para tests."""
+    """Servidor Newcamd minimo (protocolo real) para tests."""
 
     def __init__(self, accept_login: bool = True, send_cw: bool = False) -> None:
         super().__init__(daemon=True)
@@ -51,8 +56,9 @@ class FakeNewcamdServer(threading.Thread):
         self._listener.settimeout(5.0)
         self.port = self._listener.getsockname()[1]
         self._stopped = threading.Event()
-        self.received_username: bytes | None = None
-        self.received_block: bytes | None = None
+        self.key = derive_triple_des_key(DESKEY, SERVER_KEY)
+        self.received_user = ""
+        self.received_password = ""
         self.received_ecm = 0
 
     def run(self) -> None:
@@ -72,36 +78,48 @@ class FakeNewcamdServer(threading.Thread):
     def _serve(self, conn: socket.socket) -> None:
         try:
             conn.settimeout(5.0)
-            # 1) nonce de 8 bytes
-            conn.sendall(NONCE)
-            # 2) login: usuario en claro + bloque cifrado de 32 bytes
-            head = self._recv_exact(conn, 20)
-            encrypted = self._recv_exact(conn, 32)
-            self.received_username = head
-            self.received_block = encrypted
-            plain = decrypt_login(encrypted, NONCE)
-            ok = (
-                self.accept_login
-                and head.rstrip(b"\x00").decode(errors="replace") == USER
-                and plain[0:20].rstrip(b"\x00").decode(errors="replace") == PASSWORD
-                and plain[20:32] == DESKEY[:12]
-            )
-            # respuesta de login: longitud (2) + resultado (1)
-            conn.sendall(struct.pack(">H", 1) + bytes((0x00 if ok else 0x01,)))
+            conn.sendall(SERVER_KEY)
+            packet = self._read_packet(conn)
+            if packet is None:
+                return
+            message_type, payload, body, msg_id = parse_packet(packet, self.key)
+            if message_type != MSG_LOGIN:
+                return
+            user, _, password = payload.partition(b"\x00")
+            self.received_user = user.decode("latin-1")
+            self.received_password = password.rstrip(b"\x00").decode("latin-1")
+            ok = self.accept_login and self.received_user == USER and self.received_password == PASSWORD
+            conn.sendall(build_packet(MSG_LOGIN_ACK if ok else MSG_LOGIN_NAK, b"", self.key, (msg_id + 1) & 0xFFFF))
             if not ok:
                 return
-            # 3) peticiones ECM
+
+            packet = self._read_packet(conn)
+            if packet is None:
+                return
+            message_type, _payload, _body, msg_id = parse_packet(packet, self.key)
+            if message_type == MSG_CARD_DATA_REQ:
+                data = bytearray(20)
+                data[3] = 1
+                data[4] = 0x18
+                data[5] = 0x02
+                data[6:14] = b"USERADDR"
+                data[14] = 1
+                conn.sendall(build_packet(MSG_CARD_DATA, bytes(data), self.key, (msg_id + 1) & 0xFFFF))
+
             while not self._stopped.is_set():
-                header = self._recv_exact(conn, 4)
-                if len(header) < 4:
+                packet = self._read_packet(conn)
+                if packet is None:
                     break
-                length = struct.unpack(">I", header)[0]
-                self._recv_exact(conn, max(0, length - 4))
-                self.received_ecm += 1
-                if self.send_cw:
-                    payload = (b"\x00" + CW + struct.pack(">H", 1)).ljust(13, b"\x00")
-                    conn.sendall(struct.pack(">I", len(payload)) + payload)
-        except OSError:
+                message_type, _payload, _body, msg_id = parse_packet(packet, self.key)
+                if 0x80 <= message_type <= 0x8F:
+                    self.received_ecm += 1
+                    if self.send_cw:
+                        response = bytearray(19)
+                        response[0] = message_type
+                        response[3:11] = CW
+                        response[11:19] = CW[::-1]
+                        conn.sendall(build_packet(message_type, bytes(response), self.key, (msg_id + 1) & 0xFFFF))
+        except (OSError, NewcamdError):
             pass
         finally:
             try:
@@ -110,17 +128,21 @@ class FakeNewcamdServer(threading.Thread):
                 pass
 
     @staticmethod
-    def _recv_exact(conn: socket.socket, size: int) -> bytes:
-        buffer = bytearray()
-        while len(buffer) < size:
-            try:
-                chunk = conn.recv(size - len(buffer))
-            except (socket.timeout, OSError):
-                break
+    def _read_packet(conn: socket.socket):
+        header = bytearray()
+        while len(header) < 2:
+            chunk = conn.recv(2 - len(header))
             if not chunk:
-                break
-            buffer.extend(chunk)
-        return bytes(buffer)
+                return None
+            header.extend(chunk)
+        length = int.from_bytes(header, "big")
+        body = bytearray()
+        while len(body) < length:
+            chunk = conn.recv(length - len(body))
+            if not chunk:
+                return None
+            body.extend(chunk)
+        return bytes(header + body)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -150,42 +172,52 @@ def cw_server():
 
 
 # ---------------------------------------------------------------------------
-# Criptografía del protocolo
+# Clave y paquetes
 # ---------------------------------------------------------------------------
-def test_login_block_layout():
-    """El bloque de credenciales es contraseña (20 B) + deskey (14 B)."""
-    block = build_login_block(DESKEY, PASSWORD)
-    assert len(block) == 32
-    assert block[0:20].rstrip(b"\x00").decode() == PASSWORD
-    assert block[20:32] == DESKEY[:12]
+def test_derive_key_xor_is_cyclic():
+    key = derive_triple_des_key(DESKEY, SERVER_KEY)
+    zero_key = derive_triple_des_key(DESKEY, bytes(14))
+    assert len(key) == 16
+    assert key != zero_key
 
 
-def test_login_frame_layout():
-    """El marco de login es usuario en claro (20 B) + 32 B cifrados."""
-    frame = encrypt_login(USER, PASSWORD, DESKEY, NONCE)
-    assert len(frame) == 52
-    assert frame[:20].rstrip(b"\x00").decode() == USER
-    assert frame[20:] != build_login_block(DESKEY, PASSWORD)[:32]  # cifrado
-    assert decrypt_login(frame[20:], NONCE)[:20].rstrip(b"\x00").decode() == PASSWORD
-    assert decrypt_login(frame[20:], NONCE)[20:32] == DESKEY[:12]
-
-
-def test_remote_key_y_nonce():
-    assert len(REMOTE_KEY) == 14
-    # Con el nonce del servidor la clave de cifrado cambia
-    assert encrypt_login(USER, PASSWORD, DESKEY, NONCE) != encrypt_login(USER, PASSWORD, DESKEY, REMOTE_KEY[:8])
-
-
-def test_deskey_validation():
-    account = NewcamdAccount(name="x", host="127.0.0.1", deskey="0102")
+def test_derive_key_rejects_bad_deskey():
     with pytest.raises(NewcamdError):
-        account.deskey_bytes()
-    account.deskey = "0102030405060708091011121314"
-    assert len(account.deskey_bytes()) == 14
+        derive_triple_des_key(b"\x01\x02", SERVER_KEY)
+
+
+def test_odd_parity_of_expanded_key():
+    key = derive_triple_des_key(DESKEY, SERVER_KEY)
+    for index in range(16):
+        assert bin(key[index]).count("1") % 2 == 1, f"byte {index} sin paridad impar"
+
+
+def test_packet_roundtrip():
+    key = derive_triple_des_key(DESKEY, SERVER_KEY)
+    packet = build_packet(MSG_LOGIN, b"user\x00pass", key, msg_id=7)
+    message_type, payload, body, msg_id = parse_packet(packet, key)
+    assert message_type == MSG_LOGIN
+    assert body[0] == MSG_LOGIN
+    assert payload[0:4] == b"user"
+    assert msg_id == 7
+
+
+def test_packet_checksum_detects_corruption():
+    key = derive_triple_des_key(DESKEY, SERVER_KEY)
+    packet = bytearray(build_packet(MSG_LOGIN, b"user\x00pass", key))
+    packet[20] ^= 0xFF
+    with pytest.raises(NewcamdError):
+        parse_packet(bytes(packet), key)
+
+
+def test_xor_sum():
+    assert xor_sum(b"") == 0
+    assert xor_sum(b"\x01\x02\x03") == 0
+    assert xor_sum(b"\xff\x0f") == 0xF0
 
 
 # ---------------------------------------------------------------------------
-# Handshake y login
+# Login
 # ---------------------------------------------------------------------------
 def test_login_ok(server):
     account = NewcamdAccount(
@@ -196,8 +228,10 @@ def test_login_ok(server):
         status = client.connect()
         assert status.state == "logged_in", status.message
         assert client.is_logged_in
-        assert server.received_username.rstrip(b"\x00").decode() == USER
-        assert len(server.received_block) == 32
+        assert server.received_user == USER
+        assert server.received_password == PASSWORD
+        assert status.caid == 0x1802
+        assert status.providers == 1
     finally:
         client.disconnect()
     assert not client.is_logged_in
@@ -222,7 +256,6 @@ def test_login_rejected():
 
 
 def test_connection_refused_is_reported():
-    """Puerto cerrado -> estado de error con mensaje claro, sin excepción."""
     account = NewcamdAccount(name="test", host="127.0.0.1", port=1, username="x", password="y")
     client = NewcamdClient(account, timeout=2.0)
     status = client.connect()
@@ -232,7 +265,7 @@ def test_connection_refused_is_reported():
 
 
 def test_send_ecm_and_receive_cw(cw_server):
-    received = []
+    received: list[bytes] = []
     account = NewcamdAccount(
         name="test", host="127.0.0.1", port=cw_server.port, username=USER, password=PASSWORD, deskey=DESKEY.hex()
     )
@@ -243,7 +276,7 @@ def test_send_ecm_and_receive_cw(cw_server):
         deadline = time.monotonic() + 4
         while not received and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert received, "no se recibió ningún control word"
+        assert received, "no se recibio ningun control word"
         assert received[0] == CW
         assert client.status.cw_received >= 1
         assert client.status.ecm_sent == 1
@@ -261,7 +294,7 @@ def test_ecm_without_connection_raises():
 
 
 # ---------------------------------------------------------------------------
-# Cifrado de la contraseña en reposo
+# Cifrado de la contrasena en reposo
 # ---------------------------------------------------------------------------
 def test_password_encryption_roundtrip():
     settings = get_settings()
@@ -274,7 +307,7 @@ def test_password_encryption_is_not_deterministic():
     settings = get_settings()
     first = encrypt_password("misma-clave", settings)
     second = encrypt_password("misma-clave", settings)
-    assert first != second  # nonce aleatorio
+    assert first != second
     assert decrypt_password(first, settings) == decrypt_password(second, settings) == "misma-clave"
 
 
