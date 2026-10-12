@@ -231,6 +231,75 @@ def render_service(name: str, tuner_name: str, pnr: int, output_url: str, profil
     )
 
 
+# ---------------------------------------------------------------------------
+# Bloque `cam` del motor y asignacion por canal
+# (mismo modelo que ya funciona en el panel anterior: softcams con nombre que
+#  el agente pasa a `newcamd({...})` y a `decrypt({ cam = ... })`)
+# ---------------------------------------------------------------------------
+def cam_block(profile: NewcamdProfile) -> dict[str, Any]:
+    """Bloque `cam` que entiende el agente del motor, desde un perfil guardado.
+
+    Son los mismos campos que el `newcamd({...})` nativo: host, port, user,
+    pass, key y disable_emm; ademas `softcam` para poder referenciarlo despues.
+    """
+    cam: dict[str, Any] = {
+        "host": profile.host,
+        "port": int(profile.port),
+        "user": profile.username,
+        "softcam": profile.name,
+    }
+    if profile.password:
+        cam["pass"] = profile.password
+    if profile.des_key:
+        cam["key"] = profile.des_key.upper()
+    if profile.disable_emm:
+        cam["disable_emm"] = 1
+    return cam
+
+
+def apply_cam_to_service(service: dict[str, Any], cam: dict[str, Any] | None) -> dict[str, Any]:
+    """Pone (o quita, con `cam=None`) el CAM en las entradas DVB del servicio.
+
+    Regla aprendida del panel que funciona: **nunca** se fija `ecm_pid`, porque
+    el motor se saltaria la PMT y no encontraria el CAID.
+    """
+    copia = dict(service)
+    entradas = []
+    for entrada in service.get("inputs") or []:
+        if not isinstance(entrada, dict):
+            entradas.append(entrada)
+            continue
+        if str(entrada.get("type", "")).lower() != "dvb":
+            entradas.append(entrada)
+            continue
+        opciones = dict(entrada.get("options") or {})
+        opciones.pop("ecm_pid", None)
+        if cam is None:
+            opciones.pop("cam", None)
+        else:
+            opciones["cam"] = dict(cam)
+        entradas.append({**entrada, "options": opciones})
+    copia["inputs"] = entradas
+    return copia
+
+
+def service_dvb_url(service: dict[str, Any]) -> str | None:
+    """URL `dvb://` del servicio con sus opciones (pnr, cam...), si es DVB."""
+    for entrada in service.get("inputs") or []:
+        if not isinstance(entrada, dict):
+            continue
+        if str(entrada.get("type", "")).lower() != "dvb":
+            continue
+        tuner = entrada.get("tuner") or entrada.get("device") or entrada.get("name") or "tuner_1"
+        opciones = entrada.get("options") or {}
+        partes = [f"{clave}={valor}" for clave, valor in opciones.items() if not isinstance(valor, dict)]
+        if isinstance(opciones.get("cam"), dict):
+            partes.append("cam=" + str(opciones["cam"].get("softcam") or "cam"))
+        sufijo = ("#" + "&".join(partes)) if partes else ""
+        return f"dvb://{tuner}{sufijo}"
+    return None
+
+
 def render_config(profiles: list[NewcamdProfile], services: list[dict[str, Any]]) -> str:
     """Script Lua completo (cabecera + perfiles + servicios)."""
     lineas = [

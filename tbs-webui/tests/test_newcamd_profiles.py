@@ -250,3 +250,62 @@ def test_test_tcp_connection_falla():
 def test_test_tcp_connection_host_invalido():
     assert perfil.test_tcp_connection("no vale!", 5000)["reachable"] is False
     assert perfil.test_tcp_connection("127.0.0.1", 0)["reachable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Bloque cam del motor y asignacion por canal (modelo del panel que funciona)
+# ---------------------------------------------------------------------------
+def test_cam_block_desde_perfil():
+    cam = perfil.cam_block(PERFIL)
+    assert cam["host"] == "192.168.1.50"
+    assert cam["port"] == 15000
+    assert cam["user"] == "usuario"
+    assert cam["pass"] == "secreto"
+    assert cam["key"] == "0102030405060708091011121314"
+    assert cam["disable_emm"] == 1
+    assert cam["softcam"] == "newcamd_main"
+
+
+def test_cam_block_sin_disable_emm():
+    perfil_a = perfil.NewcamdProfile(**{**PERFIL.__dict__, "disable_emm": False})
+    assert "disable_emm" not in perfil.cam_block(perfil_a)
+
+
+def test_apply_cam_a_servicio():
+    servicio = {
+        "name": "A&E HD",
+        "inputs": [{"type": "dvb", "tuner": "tuner_1", "options": {"pnr": 101, "ecm_pid": 999}}],
+        "outputs": [{"type": "udp", "url": "udp://192.168.1.201:1234"}],
+    }
+    resultado = perfil.apply_cam_to_service(servicio, perfil.cam_block(PERFIL))
+    entrada = resultado["inputs"][0]
+    assert entrada["options"]["pnr"] == 101
+    assert entrada["options"]["cam"]["softcam"] == "newcamd_main"
+    # Nunca se fija ecm_pid: el motor se saltaria la PMT
+    assert "ecm_pid" not in entrada["options"]
+    # No se muta el servicio original
+    assert "cam" not in servicio["inputs"][0]["options"]
+
+
+def test_apply_cam_none_lo_quita():
+    servicio = {"inputs": [{"type": "dvb", "tuner": "t", "options": {"pnr": 1, "cam": {"user": "x"}}}]}
+    resultado = perfil.apply_cam_to_service(servicio, None)
+    assert "cam" not in resultado["inputs"][0]["options"]
+
+
+def test_service_dvb_url_con_cam():
+    servicio = {
+        "inputs": [
+            {
+                "type": "dvb",
+                "tuner": "panel_tuner_1",
+                "options": {"pnr": 101, "cam": {"softcam": "newcamd_main"}},
+            }
+        ]
+    }
+    url = perfil.service_dvb_url(servicio)
+    assert url == "dvb://panel_tuner_1#pnr=101&cam=newcamd_main"
+
+
+def test_service_dvb_url_sin_dvb():
+    assert perfil.service_dvb_url({"inputs": [{"type": "udp"}]}) is None
