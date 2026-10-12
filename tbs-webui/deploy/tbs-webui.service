@@ -1,0 +1,102 @@
+# TBS WebUI — unidad systemd de sistema.
+#
+# Instalación recomendada (sustituye los marcadores automáticamente):
+#
+#     sudo bash deploy/install.sh --enable-service
+#
+# Instalación manual: sustituye los tres marcadores y copia el resultado.
+#
+#   __TBS_USER__        usuario que ejecutará el panel (debe pertenecer al grupo
+#                       `video` para poder abrir /dev/dvb/adapterN/frontend0).
+#   __TBS_PROJECT_DIR__ ruta absoluta del directorio que contiene app/, .venv/
+#                       y run.sh (por ejemplo /home/ruben/tbs-webui).
+#   __TBS_DATA_DIR__    directorio de datos (base de datos y secret.key).
+#
+#     sudo sed -e "s|__TBS_USER__|$USER|g" \
+#              -e "s|__TBS_PROJECT_DIR__|$PWD|g" \
+#              -e "s|__TBS_DATA_DIR__|/var/lib/tbs-webui|g" \
+#              deploy/tbs-webui.service | sudo tee /etc/systemd/system/tbs-webui.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now tbs-webui
+#
+# Comprobación de sintaxis:  systemd-analyze verify /etc/systemd/system/tbs-webui.service
+
+[Unit]
+Description=TBS WebUI — panel web para tarjetas DVB TBS
+Documentation=file:__TBS_PROJECT_DIR__/README.md
+After=network-online.target
+Wants=network-online.target
+# Si el arranque falla repetidamente, deja de reintentar en bucle.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# El panel NO debe ejecutarse como root: usa el usuario propietario del proyecto.
+User=__TBS_USER__
+# Grupo con acceso a /dev/dvb/adapterN/frontend0 (crw-rw---- root:video).
+Group=video
+WorkingDirectory=__TBS_PROJECT_DIR__
+# Configuración opcional (el prefijo "-" hace que su ausencia no sea un error).
+# OJO: el entorno de systemd tiene prioridad sobre el fichero .env del proyecto.
+EnvironmentFile=-/etc/tbs-webui/tbs-webui.env
+Environment=PYTHONUNBUFFERED=1
+# ProtectSystem=strict deja el código en solo lectura; sin .pyc no hay sorpresas.
+Environment=PYTHONDONTWRITEBYTECODE=1
+# OJO IMPORTANTE: con ProtectSystem=strict, el directorio de datos DEBE estar
+# declarado en ReadWritePaths. Si TBS_DATA_DIR no se define aquí, la aplicación
+# usaría <proyecto>/data (bajo /home, en solo lectura) y SQLite fallaría con
+# "attempt to write a readonly database". Por eso se fija en la unidad y el
+# EnvironmentFile lo puede sobrescribir.
+Environment=TBS_DATA_DIR=__TBS_DATA_DIR__
+
+# Mensaje claro si todavía no se ha creado el entorno virtual.
+ExecStartPre=/bin/sh -c 'test -x __TBS_PROJECT_DIR__/.venv/bin/python || { echo "Falta __TBS_PROJECT_DIR__/.venv; ejecuta deploy/install.sh"; exit 1; }'
+# /bin/sh -c permite usar los valores por defecto si el EnvironmentFile no existe.
+# --no-proxy-headers: uvicorn confía por defecto en X-Forwarded-For de 127.0.0.1
+# y reescribe la IP del cliente; eso permitiría falsificar la auditoría y la
+# ventana de intentos. La app sólo usa XFF si TBS_TRUST_PROXY_HEADERS=1.
+ExecStart=/bin/sh -c 'exec __TBS_PROJECT_DIR__/.venv/bin/python -m uvicorn app.main:app --host "${TBS_HOST:-0.0.0.0}" --port "${TBS_PORT:-9000}" --no-access-log --no-proxy-headers'
+
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+# SIGINT = parada ordenada de uvicorn (cierra el dispositivo DVB y el escaneo).
+KillSignal=SIGINT
+
+# --- Endurecimiento ---------------------------------------------------------
+# Sin privilegios extra, con /usr y el resto del sistema en solo lectura.
+NoNewPrivileges=yes
+# OJO: PrivateTmp da al servicio un /tmp privado (tmpfs). Por eso ni el
+# proyecto ni TBS_DATA_DIR pueden estar bajo /tmp o /var/tmp: systemd no
+# encontraría WorkingDirectory ni ReadWritePaths.
+PrivateTmp=yes
+ProtectSystem=strict
+# El proyecto puede estar en /home: se necesita leerlo, no escribirlo.
+ProtectHome=read-only
+# Único directorio escribible por el servicio (BD SQLite, secret.key, logs).
+ReadWritePaths=__TBS_DATA_DIR__
+StateDirectory=tbs-webui
+StateDirectoryMode=0700
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# --- Dispositivos DVB --------------------------------------------------------
+# OJO (comprobado en hardware, systemd 249 / Ubuntu 22.04): NO poner
+# `DeviceAllow=char-dvb rw`. En esta versión de systemd esa regla NO deja pasar
+# los nodos /dev/dvb/adapterN/*: los clasifica como "char-*" y al añadir
+# DeviceAllow se activa el filtro de dispositivos del cgroup, de modo que
+# `open("/dev/dvb/adapter0/frontend0")` falla con EPERM y el panel queda sin
+# acceso a la tarjeta. El control de acceso correcto (y suficiente) es el de
+# fichero: `Group=video` + nodos `crw-rw---- root:video`.
+# Si en tu sistema quieres restringir dispositivos, declara explícitamente los
+# nodos con su major:minor, por ejemplo:
+#     DeviceAllow=/dev/dvb/adapter0/frontend0 rw
+#     DeviceAllow=/dev/dvb/adapter0/demux0 rw
+# y verifica SIEMPRE con: curl -s localhost:9000/api/adapters | jq '.adapters[].name'
+
+[Install]
+WantedBy=multi-user.target

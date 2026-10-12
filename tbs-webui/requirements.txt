@@ -1,0 +1,26 @@
+# TBS WebUI — dependencias de Python (3.11+)
+# Instalación: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# --- Web ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9
+
+# --- Validación ---
+pydantic>=2.7,<3.0
+# Nota: la configuración NO usa pydantic-settings; se leen las variables de
+# entorno de forma explícita en app/config.py (menos dependencias y comportamiento
+# idéntico en cualquier entorno).
+
+# --- Base de datos ---
+SQLAlchemy>=2.0,<3.0
+
+# --- Seguridad ---
+argon2-cffi>=23.1
+itsdangerous>=2.2
+
+# --- Utilidades del sistema DVB ---
+# El acceso a /dev/dvb usa ioctl vía stdlib (fcntl/struct); no se requieren
+# bindings externos. v4l-utils/dvb-tools se instalan por apt (ver install.sh).
+
+# --- Tests (opcional; ver requirements-dev.txt) ---

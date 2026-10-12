@@ -1,0 +1,29 @@
+# --- Secretos y datos locales (NUNCA versionar) ---
+.env
+.env.*
+!.env.example
+!.env.remote.example
+data/
+*.key
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Entornos y cachés ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+htmlcov/
+.coverage
+
+# --- Sistema ---
+.DS_Store
+Thumbs.db
+*.log

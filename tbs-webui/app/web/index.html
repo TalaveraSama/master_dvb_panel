@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Panel web para controlar una tarjeta DVB TBS en Ubuntu: señal en vivo, sintonización, escaneo y canales.">
+  <title>Panel · TBS WebUI</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1220'/%3E%3Cpath d='M6 20a12 12 0 0 1 12-12' stroke='%2338bdf8' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='23' cy='9' r='3' fill='%23fbbf24'/%3E%3Cpath d='M6 26a18 18 0 0 1 18-18' stroke='%2338bdf8' stroke-width='3' fill='none' stroke-linecap='round' opacity='.55'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Saltar al contenido principal</a>
+
+  <div id="boot-overlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <h1>Sin conexión con el servidor</h1>
+      <p id="boot-message">No se pudo contactar con la API de TBS WebUI.</p>
+      <button id="boot-retry" type="button" class="btn btn-primary">Reintentar</button>
+    </div>
+  </div>
+
+  <div id="app-shell" x-data="{ navOpen: false }" @keydown.escape.window="navOpen = false">
+    <header class="topbar">
+      <button id="nav-toggle" type="button" class="icon-btn nav-toggle"
+              aria-label="Mostrar u ocultar la navegación" aria-controls="sidenav" aria-expanded="false"
+              :aria-expanded="navOpen ? 'true' : 'false'"
+              @click="navOpen = !navOpen">
+        <span aria-hidden="true">☰</span>
+      </button>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">TBS WebUI</span>
+        <span id="app-version" class="brand-version"></span>
+      </div>
+      <span id="mock-badge" class="badge badge-warn" hidden>MODO SIMULACIÓN</span>
+
+      <div class="topbar-spacer"></div>
+
+      <div id="conn-status" class="conn conn-warn" role="status" aria-live="polite"
+           x-data="{ open: false }" @click="open = !open" @keydown.enter.prevent="open = !open"
+           tabindex="0" aria-label="Estado de la conexión">
+        <span id="conn-dot" class="dot conn-warn" aria-hidden="true"></span>
+        <span id="conn-text" class="conn-text">Conectando…</span>
+        <span id="conn-detail" class="conn-detail" x-show="open" x-cloak></span>
+      </div>
+
+      <div class="user">
+        <span id="user-name" class="user-name">sesión</span>
+        <button id="logout-btn" type="button" class="btn btn-ghost btn-sm">Cerrar sesión</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav id="sidenav" class="sidenav" aria-label="Navegación principal" :class="{ 'nav-open': navOpen }">
+        <ul class="nav-list">
+          <li><a class="nav-link" href="#/dashboard" data-route="dashboard" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">▤</span> Panel</a></li>
+          <li><a class="nav-link" href="#/tune" data-route="tune" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⌖</span> Sintonización</a></li>
+          <li><a class="nav-link" href="#/scan" data-route="scan" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">≣</span> Escaneo</a></li>
+          <li><a class="nav-link" href="#/channels" data-route="channels" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">☰</span> Canales</a></li>
+          <li><a class="nav-link" href="#/transponders" data-route="transponders" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⌸</span> Transponders</a></li>
+          <li><a class="nav-link" href="#/settings" data-route="settings" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⚙</span> Ajustes</a></li>
+        </ul>
+        <p class="nav-foot muted small">Sin CDN · Alpine.js local · datos del backend por cookie de sesión.</p>
+      </nav>
+
+      <main id="main" class="main" tabindex="-1">
+
+        <!-- ================= PANEL ================= -->
+        <section class="view" data-view="dashboard" aria-labelledby="h-dashboard">
+          <header class="view-head">
+            <h1 id="h-dashboard">Panel de señal</h1>
+            <p class="muted">Estado del receptor, barras en vivo y gráfica de los últimos 60 segundos.</p>
+          </header>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head">
+                <h2>Señal</h2>
+                <span id="dash-lock-badge" class="lock-badge is-unlocked" role="status" aria-live="polite">SIN SEÑAL</span>
+              </div>
+
+              <div id="dash-flags" class="flags" role="group" aria-label="Indicadores de bloqueo del receptor">
+                <span class="flag flag-off" data-flag="signal"><span class="flag-dot" aria-hidden="true"></span><span>Señal</span></span>
+                <span class="flag flag-off" data-flag="carrier"><span class="flag-dot" aria-hidden="true"></span><span>Portadora</span></span>
+                <span class="flag flag-off" data-flag="viterbi"><span class="flag-dot" aria-hidden="true"></span><span>Viterbi</span></span>
+                <span class="flag flag-off" data-flag="sync"><span class="flag-dot" aria-hidden="true"></span><span>Sinc.</span></span>
+                <span class="flag flag-off" data-flag="lock"><span class="flag-dot" aria-hidden="true"></span><span>Lock</span></span>
+              </div>
+
+              <div class="bars">
+                <div class="bar-block">
+                  <div class="bar-head">
+                    <span class="bar-label">Nivel de señal</span>
+                    <span class="bar-value" id="bar-signal-value">—</span>
+                  </div>
+                  <div class="bar" id="bar-signal" role="progressbar" aria-label="Nivel de señal"
+                       aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="bar-fill bar-fill-signal" id="bar-signal-fill"></div>
+                  </div>
+                </div>
+                <div class="bar-block">
+                  <div class="bar-head">
+                    <span class="bar-label">Calidad</span>
+                    <span class="bar-value" id="bar-quality-value">—</span>
+                  </div>
+                  <div class="bar" id="bar-quality" role="progressbar" aria-label="Calidad de señal"
+                       aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="bar-fill bar-fill-quality" id="bar-quality-fill"></div>
+                  </div>
+                </div>
+              </div>
+
+              <p id="stats-error" class="callout callout-error" hidden></p>
+
+              <dl class="metrics">
+                <div class="metric"><dt>SNR</dt><dd id="m-snr">—</dd></div>
+                <div class="metric"><dt>CNR bruto</dt><dd id="m-cnr">—</dd></div>
+                <div class="metric"><dt>Potencia</dt><dd id="m-dbm">—</dd></div>
+                <div class="metric"><dt>Señal</dt><dd id="m-signal">—</dd></div>
+                <div class="metric"><dt>Calidad</dt><dd id="m-quality">—</dd></div>
+                <div class="metric"><dt>BER</dt><dd id="m-ber">—</dd></div>
+                <div class="metric"><dt>BER previo</dt><dd id="m-ber-pre">—</dd></div>
+                <div class="metric"><dt>PER</dt><dd id="m-per">—</dd></div>
+                <div class="metric"><dt>Bloques con error</dt><dd id="m-ucblocks">—</dd></div>
+                <div class="metric"><dt>Última lectura</dt><dd id="m-updated">—</dd></div>
+              </dl>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h2>Histórico (60 s)</h2>
+                <span class="muted small">fuente: <span id="dash-source">—</span></span>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="signal-chart" role="img"
+                        aria-label="Gráfica temporal con el nivel de señal en porcentaje y la relación señal-ruido en decibelios"></canvas>
+              </div>
+              <p class="muted small">Señal en % (azul, eje izquierdo) y SNR en dB (ámbar, eje derecho). Se actualiza cada 500 ms.</p>
+            </article>
+          </div>
+
+          <article class="card">
+            <div class="card-head">
+              <h2>Sintonización actual</h2>
+              <button id="release-btn" type="button" class="btn btn-danger-outline btn-sm">Liberar frontend</button>
+            </div>
+            <div id="tuned-summary"><p class="muted">Nada sintonizado.</p></div>
+            <p class="muted small">
+              Adaptador en uso: <strong id="dash-locked-by">libre</strong> ·
+              Modo simulación: <strong id="dash-mock-mode">—</strong>
+            </p>
+          </article>
+        </section>
+
+        <!-- ================= SINTONIZACIÓN ================= -->
+        <section class="view" data-view="tune" aria-labelledby="h-tune" hidden>
+          <header class="view-head">
+            <h1 id="h-tune">Sintonización manual</h1>
+            <p class="muted">Introduce la frecuencia del transponder en MHz; el backend resta el LNB internamente.</p>
+          </header>
+
+          <form id="tune-form" class="card" novalidate>
+            <div class="form-grid">
+              <div class="field">
+                <label for="tune-adapter">Adaptador / frontend</label>
+                <select id="tune-adapter"></select>
+              </div>
+              <div class="field">
+                <label for="tune-system">Sistema de entrega</label>
+                <select id="tune-system">
+                  <option value="DVB-S2" selected>DVB-S2</option>
+                  <option value="DVB-S">DVB-S</option>
+                  <option value="DVB-T">DVB-T</option>
+                  <option value="DVB-T2">DVB-T2</option>
+                  <option value="DVB-C">DVB-C</option>
+                  <option value="DVB-C2">DVB-C2</option>
+                  <option value="ISDB-T">ISDB-T</option>
+                  <option value="ATSC">ATSC</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="tune-frequency">Frecuencia (MHz)</label>
+                <input id="tune-frequency" name="frequency" type="number" inputmode="decimal" step="0.001" min="0" max="2200" value="11096" required>
+                <p class="hint" id="tune-freq-hint">Introduce la frecuencia del transponder en MHz.</p>
+              </div>
+              <div class="field" data-sat-only>
+                <label for="tune-polarization">Polarización</label>
+                <select id="tune-polarization">
+                  <option value="">Automática</option>
+                  <option value="V" selected>V (vertical)</option>
+                  <option value="H">H (horizontal)</option>
+                  <option value="L">L (circular izquierda)</option>
+                  <option value="R">R (circular derecha)</option>
+                </select>
+              </div>
+              <div class="field" data-sat-only>
+                <label for="tune-symbolrate">Symbol rate (ksps)</label>
+                <input id="tune-symbolrate" type="number" inputmode="numeric" step="1" min="0" value="27500">
+              </div>
+              <div class="field" data-sys="sat cable">
+                <label for="tune-fec">FEC</label>
+                <select id="tune-fec">
+                  <option value="">AUTO</option>
+                  <option value="1/2">1/2</option>
+                  <option value="2/3">2/3</option>
+                  <option value="3/4" selected>3/4</option>
+                  <option value="5/6">5/6</option>
+                  <option value="7/8">7/8</option>
+                  <option value="1/4">1/4</option>
+                  <option value="3/5">3/5</option>
+                  <option value="4/5">4/5</option>
+                  <option value="8/9">8/9</option>
+                  <option value="9/10">9/10</option>
+                </select>
+              </div>
+              <div class="field" data-sys="sat terr cable">
+                <label for="tune-modulation">Modulación</label>
+                <select id="tune-modulation">
+                  <option value="">AUTO (por defecto del sistema)</option>
+                  <option value="QPSK">QPSK</option>
+                  <option value="8PSK" selected>8PSK</option>
+                  <option value="16APSK">16APSK</option>
+                  <option value="32APSK">32APSK</option>
+                  <option value="QAM16">QAM16</option>
+                  <option value="QAM32">QAM32</option>
+                  <option value="QAM64">QAM64</option>
+                  <option value="QAM128">QAM128</option>
+                  <option value="QAM256">QAM256</option>
+                  <option value="8VSB">8VSB</option>
+                  <option value="16VSB">16VSB</option>
+                </select>
+              </div>
+              <div class="field" data-sys="sat">
+                <label for="tune-rolloff">Roll-off</label>
+                <select id="tune-rolloff">
+                  <option value="">AUTO</option>
+                  <option value="0.20">0,20</option>
+                  <option value="0.25">0,25</option>
+                  <option value="0.35" selected>0,35</option>
+                </select>
+              </div>
+              <div class="field" data-sys="sat">
+                <label for="tune-pilot">Piloto</label>
+                <select id="tune-pilot">
+                  <option value="">AUTO</option>
+                  <option value="ON">ON</option>
+                  <option value="OFF">OFF</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-bandwidth">Ancho de banda (MHz)</label>
+                <select id="tune-bandwidth">
+                  <option value="">AUTO</option>
+                  <option value="8" selected>8</option>
+                  <option value="7">7</option>
+                  <option value="6">6</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-guard">Intervalo de guarda</label>
+                <select id="tune-guard">
+                  <option value="">AUTO</option>
+                  <option value="1/32">1/32</option>
+                  <option value="1/16">1/16</option>
+                  <option value="1/8">1/8</option>
+                  <option value="1/4">1/4</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-transmission">Modo de transmisión</label>
+                <select id="tune-transmission">
+                  <option value="">AUTO</option>
+                  <option value="2K">2K</option>
+                  <option value="8K">8K</option>
+                  <option value="4K">4K</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-hierarchy">Jerarquía</label>
+                <select id="tune-hierarchy">
+                  <option value="">AUTO</option>
+                  <option value="NONE">Ninguna</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="4">4</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-code-rate-hp">Code rate HP</label>
+                <select id="tune-code-rate-hp">
+                  <option value="">AUTO</option>
+                  <option value="1/2">1/2</option>
+                  <option value="2/3">2/3</option>
+                  <option value="3/4">3/4</option>
+                  <option value="5/6">5/6</option>
+                  <option value="7/8">7/8</option>
+                </select>
+              </div>
+              <div class="field" data-sys="terr">
+                <label for="tune-code-rate-lp">Code rate LP</label>
+                <select id="tune-code-rate-lp">
+                  <option value="">AUTO</option>
+                  <option value="1/2">1/2</option>
+                  <option value="2/3">2/3</option>
+                  <option value="3/4">3/4</option>
+                  <option value="5/6">5/6</option>
+                  <option value="7/8">7/8</option>
+                </select>
+              </div>
+              <div class="field" data-sys="sat">
+                <label for="tune-stream-id">Stream ID (multistream)</label>
+                <input id="tune-stream-id" type="number" inputmode="numeric" step="1" min="0" placeholder="opcional">
+              </div>
+              <div class="field" data-sys="sat">
+                <label for="tune-plp-id">PLP ID</label>
+                <input id="tune-plp-id" type="number" inputmode="numeric" step="1" min="0" placeholder="opcional">
+              </div>
+              <div class="field" data-sys="sat terr cable">
+                <label for="tune-inversion">Inversión</label>
+                <select id="tune-inversion">
+                  <option value="AUTO" selected>AUTO</option>
+                  <option value="ON">ON</option>
+                  <option value="OFF">OFF</option>
+                </select>
+              </div>
+              <div class="field" data-sys="sat terr cable">
+                <label for="tune-lock-timeout">Timeout de lock (s)</label>
+                <input id="tune-lock-timeout" type="number" inputmode="decimal" step="0.5" min="0.5" max="30" value="5">
+              </div>
+            </div>
+
+            <details class="disclosure" open>
+              <summary>Antena, LNB, tono y DiSEqC</summary>
+              <div class="form-grid">
+                <div class="field field-check">
+                  <label class="check">
+                    <input id="tune-use-lnb" type="checkbox" checked>
+                    <span>Aplicar conversión de LNB (banda Ku)</span>
+                  </label>
+                </div>
+                <div class="field">
+                  <label for="tune-lnb-low">LNB banda baja (kHz)</label>
+                  <input id="tune-lnb-low" type="number" inputmode="numeric" step="1" value="9750">
+                </div>
+                <div class="field">
+                  <label for="tune-lnb-high">LNB banda alta (kHz)</label>
+                  <input id="tune-lnb-high" type="number" inputmode="numeric" step="1" value="10600">
+                </div>
+                <div class="field">
+                  <label for="tune-lnb-threshold">Umbral de banda (kHz)</label>
+                  <input id="tune-lnb-threshold" type="number" inputmode="numeric" step="1" value="11700">
+                </div>
+                <div class="field">
+                  <label for="tune-tone">Tono 22 kHz</label>
+                  <select id="tune-tone">
+                    <option value="" selected>Automático según banda</option>
+                    <option value="1">Forzar encendido</option>
+                    <option value="0">Forzar apagado</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="tune-voltage">Voltaje de polarización</label>
+                  <select id="tune-voltage">
+                    <option value="" selected>Automático (H/R = 18 V, V/L = 13 V)</option>
+                    <option value="13V">13 V</option>
+                    <option value="18V">18 V</option>
+                    <option value="OFF">Apagado</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="tune-diseqc">DiSEqC</label>
+                  <select id="tune-diseqc">
+                    <option value="" selected>Desactivado</option>
+                    <option value="1.0:0">1.0 · posición 1</option>
+                    <option value="1.0:1">1.0 · posición 2</option>
+                    <option value="1.0:2">1.0 · posición 3</option>
+                    <option value="1.0:3">1.0 · posición 4</option>
+                    <option value="1.1:0">1.1 · conmutador 1</option>
+                    <option value="1.1:1">1.1 · conmutador 2</option>
+                    <option value="1.1:2">1.1 · conmutador 3</option>
+                    <option value="1.1:3">1.1 · conmutador 4</option>
+                    <option value="1.1:4">1.1 · conmutador 5</option>
+                    <option value="1.1:5">1.1 · conmutador 6</option>
+                    <option value="1.1:6">1.1 · conmutador 7</option>
+                    <option value="1.1:7">1.1 · conmutador 8</option>
+                    <option value="1.1:8">1.1 · conmutador 9</option>
+                    <option value="1.1:9">1.1 · conmutador 10</option>
+                    <option value="1.1:10">1.1 · conmutador 11</option>
+                    <option value="1.1:11">1.1 · conmutador 12</option>
+                    <option value="1.1:12">1.1 · conmutador 13</option>
+                    <option value="1.1:13">1.1 · conmutador 14</option>
+                    <option value="1.1:14">1.1 · conmutador 15</option>
+                    <option value="1.1:15">1.1 · conmutador 16</option>
+                  </select>
+                </div>
+                <div class="field field-actions">
+                  <button id="tune-save-lnb" type="button" class="btn btn-ghost btn-sm">Guardar como predeterminados</button>
+                </div>
+              </div>
+            </details>
+
+            <div class="form-actions">
+              <button id="tune-submit" type="submit" class="btn btn-primary">Sintonizar</button>
+              <button id="tune-release" type="button" class="btn btn-ghost">Liberar</button>
+            </div>
+
+            <p id="tune-result" class="callout" hidden></p>
+          </form>
+        </section>
+
+        <!-- ================= ESCANEO ================= -->
+        <section class="view" data-view="scan" aria-labelledby="h-scan" hidden>
+          <header class="view-head">
+            <h1 id="h-scan">Escaneo de servicios</h1>
+            <p class="muted">Escanea el transponder actual o una lista completa de dvb-scan-tables.</p>
+          </header>
+
+          <form id="scan-form" class="card">
+            <div class="form-grid">
+              <div class="field">
+                <label for="scan-adapter">Adaptador / frontend</label>
+                <select id="scan-adapter"></select>
+              </div>
+              <div class="field">
+                <span class="label">Origen del escaneo</span>
+                <div class="radios">
+                  <label class="check"><input id="scan-mode-current" type="radio" name="scan-mode" value="current" checked><span>Transponder actual</span></label>
+                  <label class="check"><input id="scan-mode-table" type="radio" name="scan-mode" value="table"><span>Lista completa (tabla)</span></label>
+                </div>
+                <p class="hint" id="scan-mode-hint"></p>
+              </div>
+              <div class="field" id="scan-table-row" hidden>
+                <label for="scan-table">Lista de transponders</label>
+                <select id="scan-table"></select>
+                <p class="hint" id="scan-table-info">Selecciona una lista.</p>
+              </div>
+              <div class="field">
+                <label for="scan-lock-timeout">Timeout de lock (s)</label>
+                <input id="scan-lock-timeout" type="number" inputmode="decimal" step="0.5" min="0.5" max="30" value="5">
+              </div>
+              <div class="field">
+                <label for="scan-dwell">Permanencia por transponder (s)</label>
+                <input id="scan-dwell" type="number" inputmode="decimal" step="0.5" min="0" placeholder="por defecto del backend">
+              </div>
+              <div class="field field-check">
+                <label class="check">
+                  <input id="scan-clear" type="checkbox">
+                  <span>Borrar los canales existentes antes de escanear</span>
+                </label>
+              </div>
+            </div>
+            <div class="form-actions">
+              <button id="scan-start" type="submit" class="btn btn-primary">Iniciar escaneo</button>
+              <button id="scan-stop" type="button" class="btn btn-danger-outline">Detener</button>
+            </div>
+          </form>
+
+          <article class="card">
+            <div class="card-head">
+              <h2>Progreso</h2>
+              <span id="scan-state" class="badge">idle</span>
+            </div>
+            <div class="bar" id="scan-progress" role="progressbar" aria-label="Progreso del escaneo"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div class="bar-fill bar-fill-scan" id="scan-progress-fill"></div>
+            </div>
+            <dl class="metrics">
+              <div class="metric"><dt>Porcentaje</dt><dd id="scan-percent">0,0 %</dd></div>
+              <div class="metric"><dt>Transponder</dt><dd id="scan-current-tp">—</dd></div>
+              <div class="metric"><dt>Servicios encontrados</dt><dd id="scan-services-found">0</dd></div>
+              <div class="metric"><dt>Transponders con lock</dt><dd id="scan-locked">0</dd></div>
+              <div class="metric"><dt>Transponders escaneados</dt><dd id="scan-scanned">0</dd></div>
+              <div class="metric"><dt>Total de transponders</dt><dd id="scan-total">0</dd></div>
+            </dl>
+            <p class="muted small" id="scan-message">—</p>
+            <div id="scan-errors" class="callout callout-error" hidden></div>
+          </article>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head">
+                <h2>Registro en vivo</h2>
+                <span class="muted small"><span id="scan-log-count">0</span> líneas</span>
+              </div>
+              <label class="check small">
+                <input id="scan-autoscroll" type="checkbox" checked>
+                <span>Desplazamiento automático</span>
+              </label>
+              <ul id="scan-log" class="log" role="log" aria-live="polite" aria-label="Registro del escaneo"></ul>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h2>Servicios encontrados</h2>
+                <span class="muted small"><span id="scan-services-count">0</span> servicios</span>
+              </div>
+              <div class="table-wrap">
+                <table class="table">
+                  <caption class="sr-only">Servicios detectados durante el escaneo</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">SID</th>
+                      <th scope="col">Nombre</th>
+                      <th scope="col">Proveedor</th>
+                      <th scope="col">Tipo</th>
+                      <th scope="col">VPID</th>
+                      <th scope="col">APID</th>
+                      <th scope="col">Acceso</th>
+                    </tr>
+                  </thead>
+                  <tbody id="scan-services-body">
+                    <tr><td colspan="7" class="muted center">Todavía no se han encontrado servicios.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <!-- ================= CANALES ================= -->
+        <section class="view" data-view="channels" aria-labelledby="h-channels" hidden>
+          <header class="view-head">
+            <h1 id="h-channels">Canales</h1>
+            <p class="muted">Busca, filtra, renombra y exporta la lista de servicios detectados.</p>
+          </header>
+
+          <article class="card">
+            <div class="toolbar">
+              <div class="field field-inline">
+                <label for="ch-search">Buscar</label>
+                <input id="ch-search" type="search" placeholder="nombre o proveedor" autocomplete="off">
+              </div>
+              <div class="field field-inline">
+                <label for="ch-type">Tipo</label>
+                <select id="ch-type">
+                  <option value="">Todos</option>
+                  <option value="TV">TV</option>
+                  <option value="Radio">Radio</option>
+                </select>
+              </div>
+              <div class="field field-inline">
+                <label for="ch-fta">Acceso</label>
+                <select id="ch-fta">
+                  <option value="">Todos</option>
+                  <option value="true">FTA (libre)</option>
+                  <option value="false">Cifrado</option>
+                </select>
+              </div>
+              <div class="field field-inline">
+                <label for="ch-transponder">Transponder</label>
+                <select id="ch-transponder"><option value="">Todos</option></select>
+              </div>
+              <div class="field field-inline">
+                <label for="ch-limit">Por página</label>
+                <select id="ch-limit">
+                  <option value="25">25</option>
+                  <option value="50" selected>50</option>
+                  <option value="100">100</option>
+                  <option value="200">200</option>
+                </select>
+              </div>
+              <div class="toolbar-actions">
+                <button id="ch-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar</button>
+                <a id="ch-export-m3u" class="btn btn-ghost btn-sm" href="/api/export/m3u" download>Descargar M3U</a>
+                <a id="ch-export-conf" class="btn btn-ghost btn-sm" href="/api/export/channels.conf" download>Descargar channels.conf</a>
+              </div>
+            </div>
+
+            <div class="table-actions">
+              <span class="muted small"><strong id="ch-count">0</strong> canales · <strong id="ch-selected-count">0</strong> seleccionados</span>
+              <div class="toolbar-spacer"></div>
+              <button id="ch-bulk-delete" type="button" class="btn btn-danger-outline btn-sm" disabled>Borrar seleccionados</button>
+              <button id="ch-delete-all" type="button" class="btn btn-danger-outline btn-sm">Borrar todos</button>
+            </div>
+
+            <div class="table-wrap">
+              <table class="table table-channels">
+                <caption class="sr-only">Listado de canales con acciones de renombrado y borrado</caption>
+                <thead>
+                  <tr>
+                    <th scope="col"><input id="ch-select-all" type="checkbox" aria-label="Seleccionar todos los canales de la página"></th>
+                    <th scope="col">ID</th>
+                    <th scope="col">Nombre</th>
+                    <th scope="col">Proveedor</th>
+                    <th scope="col">Tipo</th>
+                    <th scope="col">SID</th>
+                    <th scope="col">VPID / APID</th>
+                    <th scope="col">Transponder</th>
+                    <th scope="col">Acceso</th>
+                    <th scope="col">Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="ch-body">
+                  <tr><td colspan="10" class="muted center">Cargando…</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="pagination">
+              <button id="ch-prev" type="button" class="btn btn-ghost btn-sm" disabled>← Anterior</button>
+              <span class="muted small" id="ch-page-info">0–0 de 0</span>
+              <button id="ch-next" type="button" class="btn btn-ghost btn-sm" disabled>Siguiente →</button>
+              <span class="toolbar-spacer"></span>
+              <span class="muted small" id="ch-status" role="status" aria-live="polite"></span>
+            </div>
+          </article>
+        </section>
+
+        <!-- ================= TRANSPONDERS ================= -->
+        <section class="view" data-view="transponders" aria-labelledby="h-transponders" hidden>
+          <header class="view-head">
+            <h1 id="h-transponders">Transponders</h1>
+            <p class="muted">Transponders guardados en la base de datos, con el número de servicios asociados.</p>
+          </header>
+
+          <article class="card">
+            <div class="toolbar">
+              <div class="field field-inline">
+                <label for="tp-search">Buscar</label>
+                <input id="tp-search" type="search" placeholder="frecuencia, satélite, sistema…" autocomplete="off">
+              </div>
+              <div class="toolbar-actions">
+                <button id="tp-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar</button>
+              </div>
+              <span class="toolbar-spacer"></span>
+              <span class="muted small"><strong id="tp-count">0</strong> en total</span>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <caption class="sr-only">Listado de transponders</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">ID</th>
+                    <th scope="col">Sistema</th>
+                    <th scope="col">Frecuencia</th>
+                    <th scope="col">Pol.</th>
+                    <th scope="col">Symbol rate</th>
+                    <th scope="col">FEC</th>
+                    <th scope="col">Modulación</th>
+                    <th scope="col">Satélite</th>
+                    <th scope="col">Servicios</th>
+                  </tr>
+                </thead>
+                <tbody id="tp-body">
+                  <tr><td colspan="9" class="muted center">Cargando…</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="muted small" id="tp-status" role="status" aria-live="polite"></p>
+          </article>
+        </section>
+
+        <!-- ================= AJUSTES ================= -->
+        <section class="view" data-view="settings" aria-labelledby="h-settings" hidden>
+          <header class="view-head">
+            <h1 id="h-settings">Ajustes</h1>
+            <p class="muted">Valores por defecto del dispositivo, del LNB y del escaneo.</p>
+          </header>
+
+          <div class="grid-2">
+            <form id="settings-form" class="card">
+              <div class="card-head">
+                <h2>Dispositivo y LNB</h2>
+                <span class="muted small" id="settings-default"></span>
+              </div>
+              <div class="form-grid single">
+                <div class="field">
+                  <label for="set-adapter">Adaptador por defecto</label>
+                  <select id="set-adapter"></select>
+                </div>
+                <div class="field">
+                  <label for="set-lnb-type">Tipo de LNB</label>
+                  <select id="set-lnb-type">
+                    <option value="universal" selected>Universal (9750 / 10600 / 11700)</option>
+                    <option value="custom">Personalizado</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="set-lnb-low">LNB banda baja (kHz)</label>
+                  <input id="set-lnb-low" type="number" inputmode="numeric" step="1" min="0" value="9750" disabled>
+                </div>
+                <div class="field">
+                  <label for="set-lnb-high">LNB banda alta (kHz)</label>
+                  <input id="set-lnb-high" type="number" inputmode="numeric" step="1" min="0" value="10600" disabled>
+                </div>
+                <div class="field">
+                  <label for="set-lnb-threshold">Umbral de banda (kHz)</label>
+                  <input id="set-lnb-threshold" type="number" inputmode="numeric" step="1" min="0" value="11700" disabled>
+                </div>
+                <div class="field field-check">
+                  <label class="check"><input id="set-tone" type="checkbox"><span>Tono 22 kHz por defecto</span></label>
+                </div>
+                <div class="field">
+                  <label for="set-voltage">Voltaje por defecto</label>
+                  <select id="set-voltage">
+                    <option value="13V">13 V</option>
+                    <option value="18V">18 V</option>
+                    <option value="OFF">Apagado</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="set-lock-timeout">Timeout de lock (s)</label>
+                  <input id="set-lock-timeout" type="number" inputmode="decimal" step="0.5" min="0.5" max="30" value="5">
+                </div>
+                <div class="field">
+                  <label for="set-lock-timeout-ms">Timeout de lock (ms)</label>
+                  <input id="set-lock-timeout-ms" type="number" inputmode="numeric" step="50" min="50" max="10000" value="500">
+                </div>
+                <div class="field">
+                  <label for="set-dwell">Permanencia por transponder (s)</label>
+                  <input id="set-dwell" type="number" inputmode="decimal" step="0.5" min="0.5" max="60" value="8">
+                </div>
+                <div class="field">
+                  <label for="set-poll-ms">Intervalo de sondeo de señal (ms)</label>
+                  <input id="set-poll-ms" type="number" inputmode="numeric" step="100" min="100" max="5000" value="500">
+                </div>
+                <div class="field">
+                  <label for="set-history-seconds">Histórico de la gráfica (s)</label>
+                  <input id="set-history-seconds" type="number" inputmode="numeric" step="10" min="10" max="600" value="60">
+                </div>
+              </div>
+              <div class="form-actions">
+                <button id="settings-save" type="submit" class="btn btn-primary">Guardar ajustes</button>
+                <button id="settings-reload" type="button" class="btn btn-ghost">Recargar</button>
+                <span class="muted small">Modo simulación: <strong id="settings-mock">—</strong></span>
+              </div>
+            </form>
+
+            <div class="stack">
+              <form id="pw-form" class="card">
+                <div class="card-head"><h2>Cambiar contraseña</h2></div>
+                <div class="form-grid single">
+                  <div class="field">
+                    <label for="pw-current">Contraseña actual</label>
+                    <input id="pw-current" type="password" autocomplete="current-password" required>
+                  </div>
+                  <div class="field">
+                    <label for="pw-new">Contraseña nueva (mínimo 8 caracteres)</label>
+                    <input id="pw-new" type="password" autocomplete="new-password" minlength="8" required>
+                  </div>
+                  <div class="field">
+                    <label for="pw-confirm">Repite la contraseña nueva</label>
+                    <input id="pw-confirm" type="password" autocomplete="new-password" minlength="8" required>
+                  </div>
+                </div>
+                <div class="form-actions">
+                  <button id="pw-submit" type="submit" class="btn btn-primary">Cambiar contraseña</button>
+                </div>
+              </form>
+
+              <article class="card">
+                <div class="card-head">
+                  <h2>Registro del servidor</h2>
+                  <span class="muted small"><span id="logs-count">0</span> entradas</span>
+                </div>
+                <div class="form-actions">
+                  <button id="logs-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar registro</button>
+                </div>
+                <ul id="logs-list" class="log log-short" role="log" aria-label="Registro del servidor">
+                  <li class="muted log-line">Pulsa «Actualizar registro» para cargarlo.</li>
+                </ul>
+              </article>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- Avisos -->
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <!-- Diálogos nativos -->
+  <dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+    <h2 id="confirm-title">Confirmar</h2>
+    <p id="confirm-text"></p>
+    <form method="dialog" class="dialog-actions">
+      <button id="confirm-cancel" type="submit" class="btn btn-ghost" value="cancel">Cancelar</button>
+      <button id="confirm-ok" type="submit" class="btn btn-primary" value="ok">Confirmar</button>
+    </form>
+  </dialog>
+
+  <dialog id="prompt-dialog" class="dialog" aria-labelledby="prompt-title">
+    <h2 id="prompt-title">Editar</h2>
+    <form method="dialog">
+      <div class="field">
+        <label for="prompt-input" id="prompt-label">Valor</label>
+        <input id="prompt-input" type="text" maxlength="120">
+      </div>
+      <div class="dialog-actions">
+        <button id="prompt-cancel" type="submit" class="btn btn-ghost" value="cancel">Cancelar</button>
+        <button id="prompt-ok" type="submit" class="btn btn-primary" value="ok">Guardar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>
+    <p class="noscript">TBS WebUI necesita JavaScript activado para mostrar la señal en vivo.</p>
+  </noscript>
+
+  <script type="module" src="/js/app.js"></script>
+  <script defer src="/vendor/alpine.min.js"></script>
+</body>
+</html>

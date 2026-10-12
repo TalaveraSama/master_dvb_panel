@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Acceso al panel de control de la tarjeta DVB TBS.">
+  <title>Acceso · TBS WebUI</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1220'/%3E%3Cpath d='M6 20a12 12 0 0 1 12-12' stroke='%2338bdf8' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='23' cy='9' r='3' fill='%23fbbf24'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body class="auth-body">
+  <main class="auth-wrap">
+    <div class="auth-brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">TBS WebUI</span>
+    </div>
+
+    <!-- ================= ACCESO ================= -->
+    <section id="panel-login" class="card auth-card" aria-labelledby="h-login" hidden>
+      <h1 id="h-login">Iniciar sesión</h1>
+      <p class="muted">Panel de control de la tarjeta DVB TBS.</p>
+
+      <p id="login-notice" class="callout callout-ok" hidden></p>
+
+      <form id="login-form" novalidate>
+        <div class="field">
+          <label for="login-username">Usuario</label>
+          <input id="login-username" name="username" type="text" autocomplete="username"
+                 autocapitalize="none" spellcheck="false" required autofocus>
+        </div>
+        <div class="field">
+          <label for="login-password">Contraseña</label>
+          <div class="input-row">
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+            <button type="button" class="btn btn-ghost btn-sm reveal-btn" data-reveal="login-password"
+                    aria-label="Mostrar u ocultar la contraseña">Mostrar</button>
+          </div>
+        </div>
+        <p id="login-error" class="callout callout-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="login-submit" type="submit" class="btn btn-primary btn-block">Entrar</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ================= PRIMER ARRANQUE ================= -->
+    <section id="panel-setup" class="card auth-card" aria-labelledby="h-setup" hidden>
+      <h1 id="h-setup">Crear el administrador</h1>
+      <p id="setup-hint" class="muted" hidden>
+        No existe ningún usuario todavía. Crea la cuenta de administrador para empezar.
+      </p>
+
+      <form id="setup-form" novalidate>
+        <div class="field">
+          <label for="setup-username">Usuario</label>
+          <input id="setup-username" name="username" type="text" autocomplete="username"
+                 autocapitalize="none" spellcheck="false" minlength="3" required>
+        </div>
+        <div class="field">
+          <label for="setup-password">Contraseña (mínimo 8 caracteres)</label>
+          <div class="input-row">
+            <input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+            <button type="button" class="btn btn-ghost btn-sm reveal-btn" data-reveal="setup-password"
+                    aria-label="Mostrar u ocultar la contraseña">Mostrar</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="setup-password2">Repite la contraseña</label>
+          <div class="input-row">
+            <input id="setup-password2" name="password2" type="password" autocomplete="new-password" minlength="8" required>
+            <button type="button" class="btn btn-ghost btn-sm reveal-btn" data-reveal="setup-password2"
+                    aria-label="Mostrar u ocultar la contraseña">Mostrar</button>
+          </div>
+        </div>
+        <p id="setup-error" class="callout callout-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="setup-submit" type="submit" class="btn btn-primary btn-block">Crear administrador</button>
+        </div>
+      </form>
+    </section>
+
+    <p class="muted small auth-foot">
+      La sesión se guarda en una cookie firmada. Las acciones que modifican el receptor envían un token CSRF.
+    </p>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <noscript>
+    <p class="noscript">TBS WebUI necesita JavaScript activado para poder iniciar sesión.</p>
+  </noscript>
+
+  <script type="module" src="/js/login.js"></script>
+</body>
+</html>
