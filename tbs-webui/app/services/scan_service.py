@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import Settings
@@ -30,8 +31,8 @@ from ..database import session_scope
 from ..dvb import registry
 from ..dvb.base import DeviceBusyError, FrontendError
 from ..dvb.types import ScanProgress, ServiceInfo, Transponder, TuneParams
-from ..models import ScanJob, utcnow
-from . import channels_service, si_collector
+from ..models import ScanJob, Transponder as TransponderModel, utcnow
+from . import channels_service, si_collector, ts_capture
 from .device_manager import DeviceManager
 
 logger = logging.getLogger(__name__)
@@ -116,9 +117,25 @@ class ScanService:
             if self.is_running():
                 raise DeviceBusyError("Ya hay un escaneo en curso")
 
-        transponders = self._resolve_transponders(request)
+        # El log se limpia ANTES de resolver los transponders para que los
+        # avisos de la resolucion (p. ej. "se usa el favorito") queden en el log
+        # del escaneo que ve el usuario. No se vuelve a limpiar despues.
+        with self._lock:
+            self._log.clear()
+
+        try:
+            transponders = self._resolve_transponders(request)
+        except ValueError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensivo
+            raise ValueError(f"No se pudieron resolver los transponders: {exc}") from exc
         if not transponders:
             raise ValueError("No hay transponders que escanear: indica una tabla, una lista o sintoniza antes")
+
+        # Liberar el sintonizador si la pestaña de Sintonización lo tiene abierto:
+        # /dev/dvb/adapterN/frontendM no se puede abrir dos veces (EBUSY).
+        # Se guarda la sintonía para restaurarla cuando acabe el escaneo.
+        restore = self._release_tuner_for_scan()
 
         # Puertos de sintonizador a usar. `adapters` puede venir como lista de
         # referencias (adapter/frontend) o como lista de enteros.
@@ -143,7 +160,6 @@ class ScanService:
             self._job_id = job_id
             self._stop_event = threading.Event()
             self._services = []
-            self._log.clear()
             self._progress = ScanProgress(
                 state="running",
                 total=len(transponders),
@@ -166,6 +182,7 @@ class ScanService:
                     "dwell_seconds": dwell,
                     "lock_timeout_s": lock_timeout,
                     "clear_existing": bool(getattr(request, "clear_existing", False)),
+                    "restore": restore,
                 },
             )
             self._thread.start()
@@ -221,25 +238,33 @@ class ScanService:
     def _resolve_transponders(self, request: Any) -> list[Transponder]:
         explicit = getattr(request, "transponders", None)
         if getattr(request, "current_only", False):
+            # 1) El transponder sintonizado ahora mismo
             tuned = self.device.tuned_params()
-            if tuned is None:
-                raise ValueError("No hay ningún transponder sintonizado para 'current_only'")
-            return [
-                Transponder(
-                    delivery_system=tuned.delivery_system,
-                    frequency_khz=tuned.frequency_khz,
-                    symbol_rate_ksps=tuned.symbol_rate_ksps,
-                    polarization=tuned.polarization,
-                    fec=tuned.fec,
-                    modulation=tuned.modulation,
-                    bandwidth_mhz=tuned.bandwidth_mhz,
-                    inversion=tuned.inversion,
-                    rolloff=tuned.rolloff,
-                    pilot=tuned.pilot,
-                    stream_id=tuned.stream_id,
-                    plp_id=tuned.plp_id,
+            if tuned is not None:
+                return [self._from_tune_params(tuned)]
+
+            # 2) El transponder favorito configurado (por defecto 10970 V 27900)
+            fallback = self._favourite_transponder()
+            if fallback is not None:
+                self._log.add(
+                    f"'Actual' sin sintonía: se usa el favorito {fallback.frequency_khz // 1000} kHz",
+                    level="warning",
                 )
-            ]
+                return [fallback]
+
+            # 3) El último transponder guardado en la base de datos
+            saved = self._last_saved_transponder()
+            if saved is not None:
+                self._log.add(
+                    f"'Actual' sin sintonía: se usa el último guardado (#{getattr(saved, 'id', '?')})",
+                    level="warning",
+                )
+                return [saved]
+
+            raise ValueError(
+                "No hay ningún transponder sintonizado y no hay favorito ni transponders guardados. "
+                "Sintoniza uno primero (pestaña Sintonización) o elige 'Lista completa de dvb-scan-tables'."
+            )
         if explicit:
             from ..schemas import TransponderIn
 
@@ -257,6 +282,66 @@ class ScanService:
         if table:
             return self._load_table(table)
         return []
+
+    @staticmethod
+    def _from_tune_params(tuned: Any) -> Transponder:
+        """Convierte los parametros sintonizados en un transponder a escanear."""
+        return Transponder(
+            delivery_system=tuned.delivery_system,
+            frequency_khz=tuned.frequency_khz,
+            symbol_rate_ksps=tuned.symbol_rate_ksps,
+            polarization=tuned.polarization,
+            fec=tuned.fec,
+            modulation=tuned.modulation,
+            bandwidth_mhz=tuned.bandwidth_mhz,
+            inversion=tuned.inversion,
+            rolloff=tuned.rolloff,
+            pilot=tuned.pilot,
+            stream_id=tuned.stream_id,
+            plp_id=tuned.plp_id,
+        )
+
+    def _favourite_transponder(self) -> Transponder | None:
+        """Transponder favorito de los ajustes (p. ej. 10970 V 27900)."""
+        settings = self.settings
+        frequency = int(getattr(settings, "favourite_frequency_khz", 0) or 0)
+        if frequency <= 0:
+            return None
+        return Transponder(
+            delivery_system=getattr(settings, "favourite_delivery_system", None) or "DVB-S2",
+            frequency_khz=frequency,
+            symbol_rate_ksps=int(getattr(settings, "favourite_symbol_rate_ksps", 0) or 0) or None,
+            polarization=getattr(settings, "favourite_polarization", None),
+        )
+
+    def _last_saved_transponder(self) -> Transponder | None:
+        """Ultimo transponder guardado (el que el usuario acaba de sintonizar)."""
+        try:
+            with session_scope() as db:
+                row = db.execute(
+                    select(TransponderModel).order_by(TransponderModel.updated_at.desc()).limit(1)
+                ).scalars().first()
+                if row is None:
+                    return None
+                # Se copia para no devolver un objeto ligado a la sesion cerrada
+                return Transponder(
+                    delivery_system=row.delivery_system,
+                    frequency_khz=row.frequency_khz,
+                    symbol_rate_ksps=row.symbol_rate_ksps,
+                    polarization=row.polarization,
+                    fec=row.fec,
+                    modulation=row.modulation,
+                    bandwidth_mhz=row.bandwidth_mhz,
+                    inversion=row.inversion or "AUTO",
+                    rolloff=row.rolloff,
+                    pilot=row.pilot,
+                    stream_id=row.stream_id,
+                    plp_id=row.plp_id,
+                    sat_position=row.sat_position,
+                )
+        except Exception:  # pragma: no cover - la BD no debe romper el escaneo
+            logger.debug("No se pudo leer el ultimo transponder guardado", exc_info=True)
+            return None
 
     def _load_table(self, name: str) -> list[Transponder]:
         """Carga una tabla de dvb-scan-tables por **nombre**, no por ruta.
@@ -330,6 +415,7 @@ class ScanService:
         dwell_seconds: float,
         lock_timeout_s: float,
         clear_existing: bool,
+        restore: TuneParams | None = None,
     ) -> None:
         """Recorre la lista de **puertos de sintonizador** indicada.
 
@@ -383,7 +469,41 @@ class ScanService:
             self._log.add(f"Fallo inesperado: {exc}", level="error")
             self._finish("error", str(exc), errors)
         finally:
+            self._restore_tuner(restore)
             self._close_job()
+
+    def _release_tuner_for_scan(self) -> TuneParams | None:
+        """Libera el frontend que tuviera abierto la pestaña de Sintonización.
+
+        `/dev/dvb/adapterN/frontendM` no admite dos aperturas simultáneas, así
+        que si el gestor de dispositivo tiene la sintonía activa hay que
+        soltarla antes de escanear. Devuelve los parámetros para restaurarla al
+        terminar (o None si no había nada sintonizado).
+        """
+        tuned = self.device.tuned_params()
+        if tuned is None:
+            return None
+        try:
+            self.device.release()
+            self._log.add(
+                "Sintonizador liberado para escanear (se restaura al terminar)", level="warning"
+            )
+        except Exception:  # pragma: no cover - liberar nunca debe romper el escaneo
+            logger.debug("No se pudo liberar el sintonizador", exc_info=True)
+        return tuned
+
+    def _restore_tuner(self, params: TuneParams | None) -> None:
+        """Devuelve la sintonía original cuando termina el escaneo."""
+        if params is None:
+            return
+        try:
+            self.device.tune(params, owner="scan:restore")
+            self._log.add(
+                f"Sintonía restaurada en {params.frequency_khz // 1000} kHz (adapter{params.adapter})"
+            )
+        except Exception as exc:  # pragma: no cover - depende del hardware
+            logger.debug("No se pudo restaurar la sintonía: %s", exc)
+            self._log.add(f"No se pudo restaurar la sintonía: {exc}", level="warning")
 
     def _scan_port(
         self,
@@ -442,6 +562,15 @@ class ScanService:
                     message=f"[{index}/{len(transponders)}] {label}",
                 )
                 self._log.add(f"[{index}/{len(transponders)}] Sintonizando {label}")
+
+                # La captura del TS cierra el frontend para dejar paso a
+                # dvbv5-zap; antes de cada transponder se reabre y se afina.
+                if not _frontend_is_open(fe):
+                    try:
+                        fe.open()
+                        self._log.add("  Frontend reabierto para el siguiente transponder")
+                    except FrontendError as exc:
+                        self._log.add(f"  No se pudo reabrir el frontend: {exc}", level="warning")
 
                 params = self._tune_params(transponder, adapter, frontend, lock_timeout_s)
                 try:
@@ -524,18 +653,32 @@ class ScanService:
         return locked_count, scanned, services_total
 
     def _collect_services(self, fe: Any, dwell_seconds: float, transponder: Transponder) -> list[ServiceInfo]:
-        """Obtiene los servicios del transponder por la mejor vía disponible."""
+        """Obtiene los servicios del transponder por la mejor vía disponible.
+
+        Orden de preferencia (comprobado en la TBS 6904se):
+          1. Colector SI integrado por el demux (rápido, sin procesos externos).
+          2. **Captura del TS con `dvbv5-zap`** y análisis con `si.py`: es la vía
+             que funciona en este driver, porque el demux rechaza los filtros
+             (ENOTTY) y `dvr0` no entrega nada por sí solo.
+          3. Plan antiguo: `dvbv5-scan` sobre un fichero de canales.
+          4. Modo simulación.
+        """
         # 1) Colector SI integrado (ioctl/demux)
         if si_collector.frontend_supports_demux(fe):
             try:
                 services = si_collector.collect_services(fe, dwell_seconds=dwell_seconds)
                 if services:
                     return services
-                self._log.add("  El colector SI no encontró servicios; se prueba dvbv5-scan", level="warning")
+                self._log.add("  El colector SI no encontró servicios; se captura el TS", level="warning")
             except Exception as exc:  # pragma: no cover - depende del hardware
                 self._log.add(f"  Colector SI falló: {exc}", level="warning")
 
-        # 2) Plan B: dvbv5-scan
+        # 2) Captura del TS con dvbv5-zap (el frontend se libera antes)
+        services = self._collect_via_ts_capture(fe, dwell_seconds, transponder)
+        if services:
+            return services
+
+        # 3) Plan B: dvbv5-scan
         try:
             from ..dvb import tools as dvb_tools
 
@@ -550,13 +693,49 @@ class ScanService:
         except Exception as exc:  # pragma: no cover
             self._log.add(f"  dvbv5-scan falló: {exc}", level="warning")
 
-        # 3) Modo simulación
+        # 4) Modo simulación
         if getattr(fe, "is_mock", False):
             try:
                 return list(fe.mock_services(transponder))  # type: ignore[attr-defined]
             except Exception:  # pragma: no cover
                 logger.debug("El mock no ofrece servicios", exc_info=True)
         return []
+
+    def _collect_via_ts_capture(
+        self, fe: Any, dwell_seconds: float, transponder: Transponder
+    ) -> list[ServiceInfo]:
+        """Captura el TS con dvbv5-zap y extrae los servicios.
+
+        `dvbv5-zap` sintoniza por su cuenta, así que hay que cerrar el frontend
+        (si no, `EBUSY`). El bucle de escaneo vuelve a abrirlo/afinarlo antes de
+        cada transponder, por lo que no se pierde estado.
+        """
+        if not ts_capture.zap_available():
+            self._log.add("  dvbv5-zap no está instalado (paquete dvb-tools)", level="warning")
+            return []
+
+        info = getattr(fe, "info", None)
+        adapter = int(getattr(info, "adapter", 0) or 0)
+        frontend_id = int(getattr(info, "frontend", 0) or 0)
+
+        # Se suelta el frontend para que dvbv5-zap pueda abrirlo
+        try:
+            fe.close()
+        except Exception:  # pragma: no cover - cierre defensivo
+            logger.debug("No se pudo cerrar el frontend antes de capturar", exc_info=True)
+
+        try:
+            services, mensaje = ts_capture.collect_via_capture(
+                transponder,
+                adapter=adapter,
+                frontend=frontend_id,
+                seconds=max(4.0, float(dwell_seconds)),
+            )
+            self._log.add(f"  Captura del TS: {mensaje}")
+            return services
+        except Exception as exc:  # pragma: no cover - depende del hardware
+            self._log.add(f"  Captura del TS falló: {exc}", level="warning")
+            return []
 
     def _tune_params(
         self, transponder: Transponder, adapter: int, frontend: int, lock_timeout_s: float
@@ -654,3 +833,18 @@ class ScanService:
                     row.finished_at = utcnow()
         except Exception:  # pragma: no cover
             logger.exception("No se pudo cerrar el job de escaneo")
+
+
+def _frontend_is_open(fe: Any) -> bool:
+    """True si el frontend tiene el descriptor abierto.
+
+    Se comprueba de forma generica porque el mock no tiene `_fd` y el frontend
+    real lo pone a None al cerrarse (lo cierra la captura del TS).
+    """
+    if getattr(fe, "closed", False):
+        return False
+    fd = getattr(fe, "_fd", None)
+    if fd is None:
+        # El mock (y cualquier frontend sin descriptor) se considera abierto
+        return not hasattr(fe, "_fd")
+    return True

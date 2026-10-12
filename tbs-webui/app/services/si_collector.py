@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 from ..dvb.types import ServiceInfo
 
@@ -176,17 +176,23 @@ def collect_services(
                 continue
             if packet.pid not in (PAT_PID, SDT_PID, NIT_PID) and packet.pid not in pmt_pids:
                 continue
-            section = assembler_for(packet.pid).feed(
-                packet.payload, payload_unit_start=packet.payload_unit_start
-            )
-            if section is None:
-                continue
-            if packet.pid == PAT_PID:
-                pat_sections.append(section)
-            elif packet.pid == SDT_PID:
-                sdt_sections.append(section)
-            elif packet.pid in pmt_pids or section.table_id == 0x02:
-                pmt_sections.setdefault(packet.pid, []).append(section)
+            assembler = assembler_for(packet.pid)
+            gather = getattr(assembler, "feed_all", None)
+            if callable(gather):
+                secciones = list(gather(packet.payload, payload_unit_start=packet.payload_unit_start))
+            else:
+                unica = assembler.feed(packet.payload, payload_unit_start=packet.payload_unit_start)
+                secciones = [unica] if unica is not None else []
+            for section in secciones:
+                if packet.pid == PAT_PID:
+                    pat_sections.append(section)
+                    pmt_map = getattr(section, "pmt_map", None)
+                    if isinstance(pmt_map, dict):
+                        pmt_pids.update(int(valor) for valor in pmt_map.values() if valor)
+                elif packet.pid == SDT_PID:
+                    sdt_sections.append(section)
+                elif packet.pid in pmt_pids or getattr(section, "table_id", None) == 0x02:
+                    pmt_sections.setdefault(packet.pid, []).append(section)
 
             if len(pmt_sections) >= max_services:
                 deadline = time.monotonic()  # fin anticipado
@@ -228,3 +234,130 @@ def sections_to_services(
     if not callable(fn):
         return []
     return list(fn(list(pat_sections), list(sdt_sections), pmt_sections))
+
+
+def extract_from_transport_stream(
+    data: bytes,
+    max_services: int = 400,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> list[ServiceInfo]:
+    """Extrae los servicios de un volcado de transporte (TS) completo.
+
+    Es la via que funciona en la TBS 6904se: `dvbv5-zap -P -r` deja un fichero
+    con la PAT, la SDT y todos los PMT, y aqui se reensamblan las secciones y se
+    combinan.
+
+    Detalle importante: se usa `feed_all()`, no `feed()`. Un mismo payload de
+    paquete TS puede contener varias secciones y `feed()` devuelve solo la
+    primera; por eso antes se perdian casi todos los PMT y el escaneo acababa
+    con 0 servicios.
+    """
+    si = _load_si()
+    if si is None:
+        if log:
+            log("Sin analizador SI disponible")
+        return []
+
+    assemblers: dict[int, Any] = {}
+    pat_sections: list[Any] = []
+    sdt_sections: list[Any] = []
+    pmt_sections: dict[int, list[Any]] = {}
+    pmt_pids: set[int] = set()
+
+    def feed(pid: int, payload: bytes, start: bool) -> list[Any]:
+        if pid not in assemblers:
+            assemblers[pid] = si.SectionAssembler(pid=pid)
+        assembler = assemblers[pid]
+        gather = getattr(assembler, "feed_all", None)
+        if callable(gather):
+            return list(gather(payload, payload_unit_start=start))
+        single = assembler.feed(payload, payload_unit_start=start)
+        return [single] if single is not None else []
+
+    for packet in iter_ts_packets(data):
+        if not getattr(packet, "has_payload", True):
+            continue
+        pid = packet.pid
+        if pid not in (PAT_PID, SDT_PID, NIT_PID) and pid not in pmt_pids:
+            continue
+        try:
+            sections = feed(pid, packet.payload, bool(packet.payload_unit_start))
+        except Exception:  # pragma: no cover - depende del parser
+            continue
+        for section in sections:
+            table_id = getattr(section, "table_id", None)
+            if pid == PAT_PID:
+                pat_sections.append(section)
+                pmt_map = getattr(section, "pmt_map", None)
+                if isinstance(pmt_map, dict):
+                    pmt_pids.update(int(value) for value in pmt_map.values() if value)
+            elif pid == SDT_PID:
+                sdt_sections.append(section)
+            elif pid in pmt_pids or table_id == 0x02:
+                pmt_sections.setdefault(pid, []).append(section)
+
+    services = sections_to_services(pat_sections, sdt_sections, pmt_sections)
+    if log:
+        log(
+            f"Tablas: PAT={len(pat_sections)} SDT={len(sdt_sections)} "
+            f"PMT={len(pmt_sections)} -> {len(services)} servicios"
+        )
+    logger.info(
+        "Analisis del TS: %d servicios (PAT=%d SDT=%d PMT=%d)",
+        len(services),
+        len(pat_sections),
+        len(sdt_sections),
+        len(pmt_sections),
+    )
+    return services[:max_services] if max_services else services
+
+
+def services_from_transport_stream(data: bytes, max_services: int = 400) -> list[ServiceInfo]:
+    """Alias publico que usa `ts_capture`."""
+    return extract_from_transport_stream(data, max_services=max_services)
+
+
+def services_from_channels_conf(text: str, max_services: int = 400) -> list[ServiceInfo]:
+    """Extrae servicios de un `channels.conf` de dvbv5 (plan de respaldo)."""
+    services: list[ServiceInfo] = []
+    actual: dict[str, str] = {}
+
+    def volcar() -> None:
+        if not actual:
+            return
+        nombre = actual.get("name") or ""
+        sid = actual.get("service_id") or actual.get("sid")
+        vpid = actual.get("video_pid") or actual.get("vpid")
+        apid = actual.get("audio_pid") or actual.get("apid")
+        if not nombre or not sid or not sid.isdigit():
+            actual.clear()
+            return
+        try:
+            services.append(
+                ServiceInfo(
+                    service_id=int(sid),
+                    name=nombre,
+                    provider=actual.get("provider", ""),
+                    service_type=int(actual.get("service_type", 1) or 1),
+                    video_pid=int(vpid) if vpid and vpid.isdigit() else None,
+                    audio_pid=int(apid) if apid and apid.isdigit() else None,
+                    is_fta=actual.get("scrambled", "0") in ("0", "false", "False"),
+                )
+            )
+        except (TypeError, ValueError):
+            pass
+        actual.clear()
+
+    for linea in text.splitlines():
+        limpia = linea.strip()
+        if not limpia:
+            continue
+        if limpia.startswith("[") and limpia.endswith("]"):
+            volcar()
+            continue
+        if "=" in limpia:
+            clave, _, valor = limpia.partition("=")
+            actual[clave.strip().lower()] = valor.strip()
+    volcar()
+    return services[:max_services] if max_services else services

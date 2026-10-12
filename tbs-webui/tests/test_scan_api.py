@@ -134,10 +134,22 @@ def test_scan_requires_target(admin_client):
 
 
 def test_scan_current_only_requires_tuned(admin_client):
+    """'actual' escanea lo sintonizado y, si no hay nada, cae en el favorito."""
+    tuned_before = admin_client.get("/api/status").json().get("tuned") or {}
     response = admin_client.post(
         "/api/scan/start", json={"adapters": [{"adapter": 0}], "current_only": True, "dwell_seconds": 1.0}
     )
-    assert response.status_code == 400
+    assert response.status_code == 200, response.text
+    body = _wait_scan(admin_client)
+    assert body["progress"]["state"] == "done"
+    assert body["progress"]["total"] == 1
+
+    if tuned_before.get("frequency_khz"):
+        # Ya había una sintonía: se usa esa
+        assert not any("favorito" in entry["msg"] for entry in body["log"])
+    else:
+        # Sin sintonía: se usa el favorito (10970 V 27900 por defecto)
+        assert any("favorito" in entry["msg"] for entry in body["log"])
 
     admin_client.post(
         "/api/tune",
@@ -150,3 +162,5 @@ def test_scan_current_only_requires_tuned(admin_client):
     body = _wait_scan(admin_client)
     assert body["progress"]["state"] == "done"
     assert body["progress"]["total"] == 1
+    # Ahora se usa el transponder sintonizado, no el favorito
+    assert not any("favorito" in entry["msg"] for entry in body["log"])

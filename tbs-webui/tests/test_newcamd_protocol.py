@@ -34,6 +34,7 @@ from app.services.newcamd_client import (
     xor_sum,
 )
 from app.services.md5crypt import newcamd_password
+from app.services.newcamd_crypto import load_library
 from app.services.newcamd_manager import decrypt_password, encrypt_password
 
 USER = "astra"
@@ -58,9 +59,37 @@ class FakeNewcamdServer(threading.Thread):
         self.port = self._listener.getsockname()[1]
         self._stopped = threading.Event()
         self.key = derive_triple_des_key(DESKEY, SERVER_KEY)
+        # Si la biblioteca nativa esta compilada (Linux) el cliente usa la
+        # criptografia real de newcamd; el servidor simulado habla la misma
+        # variante para que la conversacion sea valida en ambos casos.
+        self.crypto = load_library()
+        if self.crypto is not None:
+            self.key = self.crypto.login_key(SERVER_KEY, DESKEY, 14)
         self.received_user = ""
         self.received_password = ""
         self.received_ecm = 0
+
+    # -- paquetes (nativos o Python) -------------------------------------
+    def build(self, message_type: int, payload: bytes = b"") -> bytes:
+        """Monta un mensaje del servidor en el formato que use el cliente."""
+        if self.crypto is not None:
+            message = bytearray(15)
+            message[0] = message_type
+            message[1] = (len(payload) >> 8) & 0x0F
+            message[2] = len(payload) & 0xFF
+            message[3] = 0x88
+            message[4] = 0x88
+            message.extend(payload)
+            packet = self.crypto.encrypt(bytes(message), self.key)
+            return len(packet).to_bytes(2, "big") + packet
+        return build_packet(message_type, payload, self.key, 0)
+
+    def parse(self, packet: bytes) -> tuple[int, bytes]:
+        """Lee el mensaje del cliente y devuelve (tipo, payload)."""
+        if self.crypto is not None:
+            return self.crypto.decrypt(packet[2:], self.key)
+        _tipo, payload, _body, _msg = parse_packet(packet, self.key)
+        return _tipo, payload
 
     def run(self) -> None:
         try:
@@ -83,7 +112,7 @@ class FakeNewcamdServer(threading.Thread):
             packet = self._read_packet(conn)
             if packet is None:
                 return
-            message_type, payload, body, msg_id = parse_packet(packet, self.key)
+            message_type, payload = self.parse(packet)
             if message_type != MSG_LOGIN:
                 return
             user, _, password = payload.partition(b"\x00")
@@ -95,14 +124,14 @@ class FakeNewcamdServer(threading.Thread):
                 and self.received_user == USER
                 and self.received_password == newcamd_password(PASSWORD)
             )
-            conn.sendall(build_packet(MSG_LOGIN_ACK if ok else MSG_LOGIN_NAK, b"", self.key, (msg_id + 1) & 0xFFFF))
+            conn.sendall(self.build(MSG_LOGIN_ACK if ok else MSG_LOGIN_NAK))
             if not ok:
                 return
 
             packet = self._read_packet(conn)
             if packet is None:
                 return
-            message_type, _payload, _body, msg_id = parse_packet(packet, self.key)
+            message_type, _payload = self.parse(packet)
             if message_type == MSG_CARD_DATA_REQ:
                 data = bytearray(20)
                 data[3] = 1
@@ -110,13 +139,13 @@ class FakeNewcamdServer(threading.Thread):
                 data[5] = 0x02
                 data[6:14] = b"USERADDR"
                 data[14] = 1
-                conn.sendall(build_packet(MSG_CARD_DATA, bytes(data), self.key, (msg_id + 1) & 0xFFFF))
+                conn.sendall(self.build(MSG_CARD_DATA, bytes(data)))
 
             while not self._stopped.is_set():
                 packet = self._read_packet(conn)
                 if packet is None:
                     break
-                message_type, _payload, _body, msg_id = parse_packet(packet, self.key)
+                message_type, _payload = self.parse(packet)
                 if 0x80 <= message_type <= 0x8F:
                     self.received_ecm += 1
                     if self.send_cw:
@@ -124,7 +153,7 @@ class FakeNewcamdServer(threading.Thread):
                         response[0] = message_type
                         response[3:11] = CW
                         response[11:19] = CW[::-1]
-                        conn.sendall(build_packet(message_type, bytes(response), self.key, (msg_id + 1) & 0xFFFF))
+                        conn.sendall(self.build(message_type, bytes(response)))
         except (OSError, NewcamdError):
             pass
         finally:
@@ -227,7 +256,8 @@ def test_xor_sum():
 # ---------------------------------------------------------------------------
 def test_login_ok(server):
     account = NewcamdAccount(
-        name="test", host="127.0.0.1", port=server.port, username=USER, password=PASSWORD, deskey=DESKEY.hex()
+        name="test", host="127.0.0.1", port=server.port, username=USER, password=PASSWORD, deskey=DESKEY.hex(),
+        use_native_crypto=load_library() is not None,
     )
     client = NewcamdClient(account)
     try:
@@ -249,7 +279,8 @@ def test_login_rejected():
     bad.start()
     time.sleep(0.1)
     account = NewcamdAccount(
-        name="test", host="127.0.0.1", port=bad.port, username=USER, password="mala", deskey=DESKEY.hex()
+        name="test", host="127.0.0.1", port=bad.port, username=USER, password="mala", deskey=DESKEY.hex(),
+        use_native_crypto=load_library() is not None,
     )
     client = NewcamdClient(account)
     try:
@@ -262,7 +293,7 @@ def test_login_rejected():
 
 
 def test_connection_refused_is_reported():
-    account = NewcamdAccount(name="test", host="127.0.0.1", port=1, username="x", password="y")
+    account = NewcamdAccount(name="test", host="127.0.0.1", port=1, username="x", password="y", use_native_crypto=False)
     client = NewcamdClient(account, timeout=2.0)
     status = client.connect()
     assert status.state == "error"
@@ -273,7 +304,8 @@ def test_connection_refused_is_reported():
 def test_send_ecm_and_receive_cw(cw_server):
     received: list[bytes] = []
     account = NewcamdAccount(
-        name="test", host="127.0.0.1", port=cw_server.port, username=USER, password=PASSWORD, deskey=DESKEY.hex()
+        name="test", host="127.0.0.1", port=cw_server.port, username=USER, password=PASSWORD, deskey=DESKEY.hex(),
+        use_native_crypto=load_library() is not None,
     )
     client = NewcamdClient(account, on_control_word=lambda cw, sid: received.append(cw))
     try:
@@ -293,7 +325,7 @@ def test_send_ecm_and_receive_cw(cw_server):
 
 
 def test_ecm_without_connection_raises():
-    account = NewcamdAccount(name="test", host="127.0.0.1", port=1)
+    account = NewcamdAccount(name="test", host="127.0.0.1", port=1, use_native_crypto=False)
     client = NewcamdClient(account)
     with pytest.raises(NewcamdError):
         client.send_ecm(b"\x80\x30\x01")
