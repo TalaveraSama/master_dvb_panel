@@ -834,3 +834,22 @@ input[type="radio"] {
 #newcamd-rows .col-actions .btn { padding: 0.24rem 0.5rem; font-size: 0.78rem; }
 #newcamd-rows td:nth-child(2) { min-width: 10rem; }
 #newcamd-editor { border-left-width: 2px; }
+
+/* --- Transponders: editor y tabla ---------------------------------------- */
+.field-inline { min-width: 12rem; }
+#tp-editor { margin-top: 1rem; border-left-width: 2px; }
+#tp-rows td, #tp-body td { vertical-align: middle; }
+#tp-body .col-actions { width: 1%; text-align: right; white-space: nowrap; }
+#tp-body .col-actions .btn { margin: 0 0.1rem 0.15rem 0; padding: 0.24rem 0.5rem; font-size: 0.78rem; }
+@media (max-width: 1100px) {
+  #tp-body td:nth-child(9), #tp-body th:nth-child(9),
+  #tp-body td:nth-child(6), #tp-body th:nth-child(6) { display: none; }
+}
+@media (max-width: 760px) {
+  #tp-body td:nth-child(5), #tp-body th:nth-child(5),
+  #tp-body td:nth-child(7), #tp-body th:nth-child(7) { display: none; }
+}
+
+/* --- Escaneo: seleccion de varios puertos -------------------------------- */
+.ports-list { display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; }
+.ports-list .check { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.85rem; }

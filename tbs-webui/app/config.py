@@ -170,6 +170,8 @@ class Settings:
         self.newcamd_enabled = _as_bool(get("NEWCAMD_ENABLED"), True)
         self.newcamd_timeout_s = max(1.0, _as_float(get("NEWCAMD_TIMEOUT_S"), 8.0))
         self.newcamd_auto_connect = _as_bool(get("NEWCAMD_AUTO_CONNECT"), False)
+        # Webif de OSCam para mostrar el estado real de la tarjeta (PC/SC).
+        self.oscam_webif_url = get("OSCAM_WEBIF_URL", "http://127.0.0.1:8888")
 
         # --- Transponder favorito (botón de sintonización rápida) ---
         self.favourite_adapter = max(0, _as_int(get("FAVOURITE_ADAPTER"), 0))

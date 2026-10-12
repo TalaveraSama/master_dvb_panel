@@ -120,9 +120,20 @@ class ScanService:
         if not transponders:
             raise ValueError("No hay transponders que escanear: indica una tabla, una lista o sintoniza antes")
 
+        # Puertos de sintonizador a usar. `adapters` puede venir como lista de
+        # referencias (adapter/frontend) o como lista de enteros.
         adapter_refs = getattr(request, "adapters", None) or []
-        adapters = [int(getattr(ref, "adapter", 0)) for ref in adapter_refs] or [self.settings.default_adapter]
-        frontend_id = int(getattr(adapter_refs[0], "frontend", 0)) if adapter_refs else self.settings.default_frontend
+        ports: list[tuple[int, int]] = []
+        for ref in adapter_refs:
+            if isinstance(ref, int):
+                ports.append((ref, self.settings.default_frontend))
+            else:
+                ports.append((int(getattr(ref, "adapter", 0)), int(getattr(ref, "frontend", 0) or 0)))
+        if not ports:
+            ports = [(int(self.settings.default_adapter), int(self.settings.default_frontend))]
+        # Sin duplicados, conservando el orden
+        seen: set[tuple[int, int]] = set()
+        ports = [port for port in ports if not (port in seen or seen.add(port))]
 
         job_id = str(uuid.uuid4())
         dwell = float(getattr(request, "dwell_seconds", 8.0) or 8.0)
@@ -139,7 +150,10 @@ class ScanService:
                 current=0,
                 percent=0.0,
                 started_at=time.time(),
-                message=f"Escaneando {len(transponders)} transponders",
+                message=(
+                    f"Escaneando {len(transponders)} transponders"
+                    + (f" en {len(ports)} puertos" if len(ports) > 1 else "")
+                ),
             )
             self._thread = threading.Thread(
                 target=self._run,
@@ -148,15 +162,14 @@ class ScanService:
                 kwargs={
                     "job_id": job_id,
                     "transponders": transponders,
-                    "adapter": adapters[0],
-                    "frontend": frontend_id,
+                    "adapters": ports,
                     "dwell_seconds": dwell,
                     "lock_timeout_s": lock_timeout,
                     "clear_existing": bool(getattr(request, "clear_existing", False)),
                 },
             )
             self._thread.start()
-        self._record_job(job_id, adapters[0], frontend_id, len(transponders), getattr(request, "table", None))
+        self._record_job(job_id, ports[0][0], ports[0][1], len(transponders), getattr(request, "table", None))
         return job_id
 
     def stop(self) -> bool:
@@ -313,30 +326,102 @@ class ScanService:
         self,
         job_id: str,
         transponders: list[Transponder],
-        adapter: int,
-        frontend: int,
+        adapters: list[tuple[int, int]],
         dwell_seconds: float,
         lock_timeout_s: float,
         clear_existing: bool,
     ) -> None:
-        device_lock = registry.get_lock()
-        owner = f"scan:{job_id[:8]}"
-        acquired = False
+        """Recorre la lista de **puertos de sintonizador** indicada.
+
+        `adapters` es una lista de (adaptador, frontend): así se puede escanear
+        con varios sintonizadores repartiendo el trabajo (uno detrás de otro,
+        porque el hardware se toma en exclusiva por puerto).
+        """
         errors: list[str] = []
         locked_count = 0
         scanned = 0
         services_total = 0
+        total_ports = max(1, len(adapters))
 
         try:
+            for port_index, (adapter, frontend) in enumerate(adapters, start=1):
+                if self._stop_event.is_set():
+                    self._finish("cancelled", "Escaneo cancelado por el usuario", errors)
+                    return
+                self._log.add(
+                    f"Puerto de sintonizador {port_index}/{total_ports}: adapter{adapter}/frontend{frontend}"
+                )
+                result = self._scan_port(
+                    job_id=job_id,
+                    transponders=transponders,
+                    adapter=adapter,
+                    frontend=frontend,
+                    port_index=port_index,
+                    total_ports=total_ports,
+                    dwell_seconds=dwell_seconds,
+                    lock_timeout_s=lock_timeout_s,
+                    clear_existing=clear_existing,
+                    counters={"locked": locked_count, "scanned": scanned, "services": services_total},
+                    errors=errors,
+                )
+                locked_count, scanned, services_total = result
+                if self._stop_event.is_set():
+                    self._finish("cancelled", "Escaneo cancelado por el usuario", errors)
+                    return
+
+            self._finish(
+                "done",
+                f"Escaneo completado: {services_total} servicios en {scanned} transponders"
+                + (f" ({total_ports} puertos)" if total_ports > 1 else ""),
+                errors,
+            )
+        except DeviceBusyError as exc:
+            self._log.add(str(exc), level="error")
+            self._finish("error", str(exc), errors)
+        except Exception as exc:  # pragma: no cover - defensivo
+            logger.exception("Escaneo falló inesperadamente")
+            self._log.add(f"Fallo inesperado: {exc}", level="error")
+            self._finish("error", str(exc), errors)
+        finally:
+            self._close_job()
+
+    def _scan_port(
+        self,
+        job_id: str,
+        transponders: list[Transponder],
+        adapter: int,
+        frontend: int,
+        port_index: int,
+        total_ports: int,
+        dwell_seconds: float,
+        lock_timeout_s: float,
+        clear_existing: bool,
+        counters: dict[str, int],
+        errors: list[str],
+    ) -> tuple[int, int, int]:
+        """Escanea la lista de transponders usando un único puerto."""
+        device_lock = registry.get_lock()
+        owner = f"scan:{job_id[:8]}:p{port_index}"
+        acquired = False
+        locked_count = counters["locked"]
+        scanned = counters["scanned"]
+        services_total = counters["services"]
+        fe = None
+
+        try:
+            self._update_progress(
+                current=scanned,
+                transponders_locked=locked_count,
+                transponders_scanned=scanned,
+                services_found=services_total,
+                message=f"Puerto {port_index}/{total_ports}: adapter{adapter}/frontend{frontend}",
+            )
             self._log.add(f"Solicitando hardware (adaptador {adapter}, frontend {frontend})")
-            try:
-                if not device_lock.acquire(owner, timeout=self.settings.device_lock_timeout):
-                    raise DeviceBusyError(
-                        f"El dispositivo está ocupado por '{device_lock.owner}'. "
-                        "Detén la sintonización o espera a que termine."
-                    )
-            except DeviceBusyError as exc:
-                raise exc
+            if not device_lock.acquire(owner, timeout=self.settings.device_lock_timeout):
+                raise DeviceBusyError(
+                    f"El dispositivo está ocupado por '{device_lock.owner}'. "
+                    "Detén la sintonización o espera a que termine."
+                )
             acquired = True
 
             fe = registry.open_frontend(adapter, frontend)
@@ -345,12 +430,11 @@ class ScanService:
 
             for index, transponder in enumerate(transponders, start=1):
                 if self._stop_event.is_set():
-                    self._finish("cancelled", "Escaneo cancelado por el usuario", errors)
-                    return
+                    return locked_count, scanned, services_total
 
                 label = self._label(transponder)
                 self._update_progress(
-                    current=index - 1,
+                    current=scanned,
                     current_transponder=label,
                     transponders_locked=locked_count,
                     transponders_scanned=scanned,
@@ -413,38 +497,31 @@ class ScanService:
                     self._services.extend((info, transponder) for info in services)
 
                 self._update_progress(
-                    current=index,
-                    percent=round(index / len(transponders) * 100.0, 1),
+                    current=scanned,
+                    percent=round(scanned / max(1, len(transponders)) * 100.0, 1),
                     current_transponder=label,
                     transponders_locked=locked_count,
                     transponders_scanned=scanned,
                     services_found=services_total,
                 )
 
-            if self._stop_event.is_set():
-                self._finish("cancelled", "Escaneo cancelado por el usuario", errors)
-            else:
-                self._finish(
-                    "done",
-                    f"Escaneo completado: {services_total} servicios en {scanned} transponders",
-                    errors,
-                )
         except DeviceBusyError as exc:
             self._log.add(str(exc), level="error")
-            self._finish("error", str(exc), errors)
+            raise
         except Exception as exc:  # pragma: no cover - defensivo
-            logger.exception("Escaneo falló inesperadamente")
-            self._log.add(f"Fallo inesperado: {exc}", level="error")
-            self._finish("error", str(exc), errors)
+            logger.exception("Fallo escaneando el puerto adapter%s/frontend%s", adapter, frontend)
+            errors.append(f"adapter{adapter}/frontend{frontend}: {exc}")
+            self._log.add(f"Fallo en el puerto {port_index}: {exc}", level="error")
         finally:
-            try:
-                if acquired:
-                    fe.close()  # type: ignore[possibly-undefined]
-            except Exception:
-                logger.debug("Error cerrando el frontend tras el escaneo", exc_info=True)
+            if fe is not None:
+                try:
+                    fe.close()
+                except Exception:
+                    logger.debug("Error cerrando el frontend tras el escaneo", exc_info=True)
             if acquired:
                 device_lock.release(owner)
-            self._close_job()
+
+        return locked_count, scanned, services_total
 
     def _collect_services(self, fe: Any, dwell_seconds: float, transponder: Transponder) -> list[ServiceInfo]:
         """Obtiene los servicios del transponder por la mejor vía disponible."""

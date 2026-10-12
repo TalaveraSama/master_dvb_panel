@@ -27,3 +27,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+
+# Copia de referencia del codigo de Astra/CESBO (no forma parte del panel)
+forck_astra4/
+cesbo-astra-*/
+

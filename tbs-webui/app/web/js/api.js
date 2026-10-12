@@ -259,7 +259,13 @@ export const api = {
   deleteChannels: (ids) =>
     request('/channels', { method: 'DELETE', query: { ids: (ids || []).join(',') } }),
   deleteAllChannels: () => request('/channels', { method: 'DELETE', body: { all: true } }),
+  newcamdOscam: (force) => request('/newcamd/oscam', { query: force ? { force: true } : undefined }),
   transponders: (query, opts) => request('/transponders', Object.assign({ query: query }, opts)),
+  transponder: (id) => request('/transponders/' + id),
+  updateTransponder: (id, payload) => request('/transponders/' + id, { method: 'PATCH', body: payload }),
+  deleteTransponder: (id) => request('/transponders/' + id, { method: 'DELETE' }),
+  tuneTransponder: (id, payload) =>
+    request('/transponders/' + id + '/tune', { method: 'POST', body: payload, timeoutMs: 30000 }),
 
   // --- Exportación ---------------------------------------------------------
   exportM3UUrl: (query) => downloadUrl('/export/m3u', query),

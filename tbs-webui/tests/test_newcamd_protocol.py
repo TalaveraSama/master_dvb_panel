@@ -33,12 +33,13 @@ from app.services.newcamd_client import (
     parse_packet,
     xor_sum,
 )
+from app.services.md5crypt import newcamd_password
 from app.services.newcamd_manager import decrypt_password, encrypt_password
 
 USER = "astra"
 PASSWORD = "astra"
 DESKEY = bytes.fromhex("0102030405060708091011121314")
-SERVER_KEY = bytes.fromhex("0011223344556677")
+SERVER_KEY = bytes.fromhex("00112233445566778899AABBCCDD")  # 14 bytes, como Astra
 CW = bytes.fromhex("1122334455667788")
 
 
@@ -87,8 +88,13 @@ class FakeNewcamdServer(threading.Thread):
                 return
             user, _, password = payload.partition(b"\x00")
             self.received_user = user.decode("latin-1")
-            self.received_password = password.rstrip(b"\x00").decode("latin-1")
-            ok = self.accept_login and self.received_user == USER and self.received_password == PASSWORD
+            # El protocolo envia md5_crypt(pass, "$1$abcdefgh$"), no la clave en claro
+            self.received_password = password.decode("latin-1")
+            ok = (
+                self.accept_login
+                and self.received_user == USER
+                and self.received_password == newcamd_password(PASSWORD)
+            )
             conn.sendall(build_packet(MSG_LOGIN_ACK if ok else MSG_LOGIN_NAK, b"", self.key, (msg_id + 1) & 0xFFFF))
             if not ok:
                 return
@@ -229,7 +235,7 @@ def test_login_ok(server):
         assert status.state == "logged_in", status.message
         assert client.is_logged_in
         assert server.received_user == USER
-        assert server.received_password == PASSWORD
+        assert server.received_password == newcamd_password(PASSWORD)
         assert status.caid == 0x1802
         assert status.providers == 1
     finally:

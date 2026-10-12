@@ -118,6 +118,64 @@ async function load({ quiet = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Estado real de la tarjeta (OSCam)
+// ---------------------------------------------------------------------------
+function renderOscam(data) {
+  const body = byId('oscam-body');
+  const summary = byId('oscam-summary');
+  const url = byId('oscam-url');
+  if (url) url.textContent = data.url || '';
+  if (summary) {
+    summary.textContent = data.available
+      ? `OSCam ${data.version || ''}${data.card_ready ? ' · tarjeta lista' : ''}`
+      : 'OSCam no disponible';
+  }
+  if (!body) return;
+
+  if (!data.available) {
+    body.innerHTML = `<span class="badge badge-err">Sin conexión</span> ${esc(data.message || '')}`;
+    return;
+  }
+
+  const readers = data.readers || [];
+  const servicios = (data.uptime_s ? ` · en marcha ${Math.round(data.uptime_s / 60)} min` : '') +
+    (data.revision ? ` · rev ${esc(String(data.revision).slice(0, 8))}` : '');
+  const filas = readers.length
+    ? readers
+        .map((reader) => {
+          const clase = reader.ok ? 'badge badge-ok' : 'badge badge-warn';
+          const caid = reader.caid && reader.caid !== '0000' ? ` · CAID ${esc(reader.caid)}` : '';
+          const idle =
+            reader.idle_seconds !== null && reader.idle_seconds !== undefined
+              ? ` · inactivo ${reader.idle_seconds} s`
+              : '';
+          return `<li><span class="${clase}">${esc(reader.status_text)}</span>
+            <strong>${esc(reader.name)}</strong>
+            <span class="mono small">${esc(reader.protocol)}${caid}${idle}</span></li>`;
+        })
+        .join('')
+    : '<li class="muted">OSCam no tiene lectores configurados.</li>';
+
+  body.innerHTML = `
+    <div class="muted small">${esc(data.message || '')}${servicios}</div>
+    <ul class="log-list" style="margin-top:0.5rem">${filas}</ul>`;
+}
+
+async function loadOscam({ quiet = false, force = false } = {}) {
+  const boton = byId('oscam-refresh');
+  if (boton && force) setBusy(boton, true, 'Consultando…');
+  try {
+    renderOscam(await api.newcamdOscam(force));
+  } catch (error) {
+    if (!quiet) toast(error.detail || 'No se pudo consultar OSCam', 'error');
+    const body = byId('oscam-body');
+    if (body) body.innerHTML = `<span class="badge badge-err">Error</span> ${esc(error.detail || '')}`;
+  } finally {
+    if (boton && force) setBusy(boton, false);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Editor
 // ---------------------------------------------------------------------------
 function openEditor(item = null) {
@@ -398,12 +456,17 @@ export function init() {
   bind('nc-test', 'click', testForm);
   bind('nc-cancel', 'click', closeEditor);
   bind('newcamd-rows', 'click', onRowClick);
+  bind('oscam-refresh', 'click', () => loadOscam({ force: true }));
 
   load();
-  // Estado en vivo (ECM/CW y conexiones) mientras la vista está visible.
+  loadOscam();
+  // Estado en vivo (ECM/CW, conexiones y tarjeta) mientras la vista está visible.
   refreshTimer = window.setInterval(() => {
     const view = document.querySelector('section[data-view="newcamd"]');
-    if (view && !view.hidden) load({ quiet: true });
+    if (view && !view.hidden) {
+      load({ quiet: true });
+      loadOscam({ quiet: true });
+    }
   }, 5000);
 }
 

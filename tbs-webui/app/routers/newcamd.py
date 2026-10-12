@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import status as http_status
 from sqlalchemy import delete, select
 
@@ -42,8 +42,12 @@ from ..schemas import (
     OkOut,
 )
 from ..services import newcamd_manager as mgr
+from ..services import oscam_status as oscam
 
 logger = logging.getLogger(__name__)
+
+# Cache del estado de OSCam (evita golpear el webif en cada refresco de la UI)
+_OSCAM_CACHE: oscam.OscamStatusCache | None = None
 
 router = APIRouter(prefix="/newcamd", tags=["newcamd"])
 
@@ -218,6 +222,22 @@ def all_status(db: DbSession, settings: AppSettings, manager: ManagerDep) -> dic
             for row in manager.load_accounts(db)
         },
     }
+
+
+@router.get("/oscam", response_model=dict)
+def oscam_status(settings: AppSettings, force: bool = Query(default=False)) -> dict:
+    """Estado real de OSCam (tarjeta y lectores) leído de su webif.
+
+    Este es el estado que sí refleja la realidad del hardware: OSCam lee la
+    tarjeta por PC/SC y es quien descifra. El cliente Newcamd de Python no puede
+    autenticarse contra OSCam porque su cifrado DES es propio (ver
+    `app/services/oscam_status.py`).
+    """
+    global _OSCAM_CACHE
+    url = getattr(settings, "oscam_webif_url", None)
+    if _OSCAM_CACHE is None or _OSCAM_CACHE.url != url:
+        _OSCAM_CACHE = oscam.OscamStatusCache(url)
+    return _OSCAM_CACHE.get(force=force).to_dict()
 
 
 @router.post("/test", response_model=NewcamdTestOut)

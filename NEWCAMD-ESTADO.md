@@ -1,100 +1,109 @@
-# Newcamd: estado real verificado y qué falta
+# Newcamd: causa raíz verificada y estado real
 
-Fecha: 2026-10-12. Referencias usadas:
+Fecha: 2026-10-12. Referencias: código de **Astra/CESBO**
+(`modules/softcam/cam/newcamd.c`), **OSCam 2.26.09** del host
+(`module-newcamd.c` y `module-newcamd-des.c`) y **forck_astra4** (panel que usa
+el módulo `newcamd` nativo de Astra dentro de un script Lua).
 
-- **Cliente Newcamd de Astra/CESBO** (`cesbo-astra-646cc63bdf14/modules/softcam/cam/newcamd.c`),
-  que es la implementación de CS378x tomada como fuente de verdad del protocolo.
-- **OSCam real** del host: `[newcamd] port = 5000@1802:000000`,
-  `key = 0102030405060708091011121314`, usuario `astra` / `astra` (contrasena en claro).
+## Conclusión corta
 
-## Lo que la referencia de Astra aclara (y ya está implementado)
+El panel **sí habla el protocolo Newcamd correctamente** (handshake, framing,
+`md5_crypt`), pero **no puede autenticarse contra OSCam** porque OSCam **no usa
+DES estándar**:
 
-| Elemento | Detalle de la referencia | Estado |
-|---|---|---|
-| Clave del handshake | `triple_des_set_key()`: `tmp = deskey XOR server_key` (XOR **cíclico**), expansión 14→16 B con `DES_set_odd_parity` | ✅ implementado (`derive_triple_des_key`) |
-| Cifrado | **DES-EDE2-CBC** (no ECB) con IV aleatorio al final del paquete | ✅ implementado |
-| Formato de paquete | `[len 2B][msg_id 2B][provider 2B][8B][tipo][len payload 2B][payload][pad][checksum XOR]`, y todo desde el byte 2 va cifrado | ✅ implementado (`build_packet`, `parse_packet`) |
-| Checksum | XOR de todos los bytes del cuerpo (cifrado incluido) | ✅ implementado y testeado |
-| Login | `0xE0` con `usuario + '\0' + contraseña`; respuesta `0xE1` (OK) / `0xE2` (NAK) | ✅ implementado |
-| Datos de tarjeta | `0xE4` → `0xE5` con CAID, UA y lista de providers | ✅ implementado |
-| ECM | tipo `0x80..0x8F`; respuesta con los control words | ✅ implementado |
-| **Descifrado del vídeo** | Astra **NO** inyecta claves por ioctl: descifra el MPEG-TS en espacio de usuario con **FFdecsa** (`modules/softcam/FFdecsa/`) o **libdvbcsa** (`contrib/libdvbcsa.sh`) y reemite el TS limpio | ❌ fuera del alcance de un panel Python (ver abajo) |
-
-## Verificación contra el OSCam real
-
-Probado en el host con el cliente implementado:
-
-| Comprobación | Resultado |
-|---|---|
-| Conexión TCP a `127.0.0.1:5000` | ✅ OSCam registra `(newcamd) client connected to 5000 port` |
-| Clave inicial del servidor | ✅ **8 bytes** (p. ej. `87ebd27e1cdb5892`), no 14 |
-| Login enviado | ✅ OSCam lo recibe y cierra la conexión sin error de red |
-| Login aceptado | ❌ OSCam responde y desconecta como `anonymous` |
-
-### Por qué no cuadra todavía
-
-Con el handshake de 8 bytes, la respuesta de OSCam medida en crudo es
-`5f 56 fd 0c 09 63` (6 bytes) y no encaja con un marco
-`[longitud][cuerpo]`: si esos dos primeros bytes fueran la longitud, el cuerpo
-que sigue sería de 4 bytes, y el `0xE1/0xE2` no aparece. Las pruebas con 14 bytes
-de clave inicial no reciben respuesta.
-
-La conclusión honesta es que **este OSCam no habla exactamente el mismo framing
-que documenta la versión de Astra del repositorio** (puede ser una variante de
-newcamd, o la respuesta va cifrada de otra forma). Para cerrarlo hacen falta los
-bytes exactos de un login correcto de un cliente de referencia:
-
-```bash
-# en el host, mientras un cliente newcamd conocido (por ejemplo tvheadend,
-# ncam o el propio oscam como cliente) hace login contra el puerto 5000:
-sudo tcpdump -X -s0 -i lo 'tcp port 5000' -c 40
-# o, si el cliente se ejecuta en la misma máquina:
-strace -f -xx -s 400 -e trace=sendto,recvfrom,read,write <cliente> 2>&1 | grep -A2 5000
+```c
+/* oscam: module-newcamd-des.c */
+unsigned char *nc_des_login_key_get(unsigned char *key1, unsigned char *key2, int len, unsigned char *des16)
+{
+    unsigned char des14[14];
+    memcpy(des14, key1, sizeof(des14));
+    for(i = 0; i < len; i++) { des14[i % 14] ^= key2[i]; }
+    des16 = des_key_spread(des14, des16);
+    doPC1(des16);        /* <-- permutación de clave propia de OSCam */
+    doPC1(des16 + 8);    /* <-- idem */
+    return des16;
+}
 ```
 
-Con ese volcado se ajustan dos funciones (`build_packet`/`parse_packet`) y se
-añade el caso como test en `tests/test_newcamd_protocol.py`, que ya incluye un
-servidor simulado del protocolo.
+Además su cifrado (`EuroDes` / `nc_des`) es una implementación **propia** de DES,
+no `DES_ede2_cbc_encrypt` de OpenSSL. Por eso un cliente en Python con
+`pycryptodome` **nunca** podrá autenticarse contra OSCam: aunque el login esté
+perfecto, la clave derivada difiere y OSCam cierra la conexión **sin responder
+nada** (no envía siquiera `0xE2` de rechazo).
 
-## Importante: Newcamd solo no abre el canal
+Astra/CESBO **no** aplica `doPC1()`, así que el mismo cliente sí funcionaría con
+Astra o con un servidor Newcamd estándar (por ejemplo NCam con otro tipo de
+usuario, o cualquier cardserver que use DES normal).
 
-Aunque el login Newcamd funcione, **la imagen seguirá cifrada** si el panel no
-descifra el TS. El panel actual (FastAPI + Python) puede:
+## Lo que quedó implementado y verificado
 
-- sintonizar y medir señal (hecho y verificado en la 6904se),
-- escanear y guardar canales (hecho),
-- hablar Newcamd y obtener los control words (implementado),
+| Elemento | Estado |
+|---|---|
+| Handshake de **14 bytes** (lo que envía OSCam) | ✅ verificado con tráfico real |
+| Clave `deskey XOR server_key` + expansión 14→16 + paridad impar | ✅ idéntico a Astra |
+| Framing `[len 2B][msg_id][provider][tipo][len payload][payload][pad][checksum XOR]` | ✅ verificado |
+| Cifrado **DES-EDE2-CBC** con IV aleatorio al final | ✅ idéntico a Astra |
+| Login `0xE0` con **`md5_crypt(pass, "$1$abcdefgh$")`** (34 caracteres) | ✅ 32 tests contra `crypt(3)` |
+| `0xE1/0xE2` (ACK/NAK), `0xE4/0xE5` (datos de tarjeta), `0x80..0x8F` (ECM) | ✅ servidor simulado en tests |
+| Contraseñas cifradas en SQLite (AES-CTR) | ✅ |
+| **Estado real de la tarjeta** vía webif de OSCam | ✅ verificado en el host |
 
-pero **no** puede descifrar un MPEG-TS en tiempo real en Python con garantías
-(haría falta FFdecsa/libdvbcsa en C, como hace Astra, y reemitir el TS por
-HTTP/UDP con `dvbv5-zap` o el demux).
+### `md5_crypt` corregido
 
-Opciones realistas para "abrir canales":
+La implementación anterior no coincidía con glibc por **una condición invertida**
+en el bucle "weird" del algoritmo (el C hace `md5_update(&ctx, (i & 1) ? final : pw, 1)`:
+bit a 1 → un byte `0x00`; bit a 0 → **sólo `pw[0]`**). Ahora coincide byte a byte
+con `crypt(3)` en 7 vectores fijos y 200 contraseñas aleatorias. Son **34**
+caracteres (el `char passwd[36]` del C son 34 útiles + NUL).
 
-1. **Delegar en un servidor de streaming** ya probado (Astra, TVHeadend,
-   tvheadend + OSCam). El panel queda como gestor/configurador: sintoniza,
-   escanea, guarda canales, gestiona las cuentas Newcamd y exporta la lista M3U.
-2. **Añadir un pipeline de descifrado en C** (FFdecsa o libdvbcsa) invocado
-   desde Python, con `dvbv5-zap` alimentando el demux y un pequeño servidor
-   HTTP/UDP para el TS limpio. Es un desarrollo aparte (y sensible a la carga
-   de CPU), no un ajuste del panel.
+## La vía que sí funciona: estado real de OSCam
 
-Recomendación: usar la opción 1 con Astra/TVHeadend para la parte de vídeo y
-dejar este panel como interfaz de control (que es exactamente lo que ya hace y
-está verificado).
+El host tiene OSCam 2.26.09 con la tarjeta leída por **PC/SC**:
 
-## Uso del panel (operativo)
+```
+reader: tv_box4_1802  protocol=pcsc  status=CARDOK   (CAID 1802)
+```
 
-- Pestaña **Newcamd** → *Nueva cuenta*: nombre, servidor, puerto (5000 aquí),
-  usuario, contraseña y deskey.
-- **Probar**: intenta el login y muestra el motivo exacto del fallo.
-- **Conectar / Desconectar**: mantiene la sesión y muestra ECM enviados,
-  control words recibidos, CAID, providers y el último CW.
-- La contraseña se guarda cifrada (AES-CTR con clave derivada del secreto de la
-  aplicación) y **nunca** se devuelve por la API.
+OSCam expone su webif en `http://127.0.0.1:8888` **sin autenticación en red
+local**, y su API XML da el estado completo:
+
+```
+GET /oscamapi.html?part=status
+<oscam version="2.26.09-11968" uptime="41288">
+  <status>
+    <client type="r" name="tv_box4_1802" protocol="pcsc">
+      <connection ip="local">CARDOK</connection>
+      ...
+```
+
+El panel lo consume (`app/services/oscam_status.py` + `GET /api/newcamd/oscam`) y
+la pestaña **Newcamd** muestra: versión de OSCam, uptime, lectores con su estado
+de tarjeta (`Tarjeta lista`), CAID, inactividad y clientes conectados. Verificado
+en el panel real: **10/10 comprobaciones** en navegador (`tools/ui-check-oscam.mjs`).
+
+## Cómo abrir canales de verdad
+
+OSCam es quien tiene la tarjeta y quien puede descifrar. Dos caminos:
+
+1. **Recomendado (sin desarrollo extra):** dejar que **Astra** (que usa su módulo
+   `newcamd` nativo y `libdvbcsa`/FFdecsa en C) o **TVHeadend** consuman OSCam y
+   hagan el descifrado; el panel sigue siendo la interfaz de control:
+   sintoniza, mide señal, escanea, guarda canales, muestra el estado real de la
+   tarjeta y exporta M3U/channels.conf. El formulario equivalente al de Astra
+   (`NAME / ID / PROTOCOL=NewCAMd / ADDRESS / PORT / LOGIN / PASSWORD` +
+   `DES KEY / CAID / TIMEOUT / SHIFT / make new connection for each input`) está
+   documentado aquí como modelo a replicar si se quiere configurar Astra desde el
+   panel.
+2. **Portar el DES de OSCam a C** (`module-newcamd-des.c`: `doPC1`, `desCore`,
+   `EuroDes`, `nc_des_encrypt`) y llamarlo desde Python con `ctypes`. Es viable
+   pero es un desarrollo aparte y no aporta nada que OSCam/Astra no hagan ya.
+
+**No** se puede descifrar en Python: el descifrado del MPEG-TS se hace en espacio
+de usuario con FFdecsa/libdvbcsa (C), como demuestra el propio módulo `softcam`
+de Astra.
 
 ## Aviso legal
 
 Newcamd es un protocolo de *card sharing*. Úsalo sólo con servidores de tu
-propiedad o para los que tengas autorización expresa (por ejemplo tu propio
-OSCam con tu tarjeta, o el servidor de tu operador).
+propiedad o para los que tengas autorización expresa (tu propio OSCam leyendo tu
+tarjeta, o el servidor de tu operador).

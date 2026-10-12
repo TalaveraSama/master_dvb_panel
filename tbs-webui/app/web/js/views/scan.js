@@ -13,6 +13,64 @@ import { toast } from '../ui.js';
 
 const POLL_MS = 1000;
 
+/**
+ * Pinta las casillas de "puertos adicionales" para repartir el escaneo entre
+ * varios sintonizadores. El puerto elegido en el desplegable siempre entra.
+ */
+function renderPorts() {
+  const host = byId('scan-ports');
+  if (!host) return;
+  const adapters = store.state.adapters || [];
+  if (!adapters.length) {
+    host.innerHTML = '<span class="muted small">Sin adaptadores detectados.</span>';
+    return;
+  }
+  const marcados = new Set(
+    [...host.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value)
+  );
+  host.innerHTML = '';
+  adapters.forEach((adapter) => {
+    const value = adapter.adapter + ':' + (adapter.frontend === undefined ? 0 : adapter.frontend);
+    const label = document.createElement('label');
+    label.className = 'check';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = value;
+    input.checked = marcados.has(value);
+    const span = document.createElement('span');
+    span.textContent =
+      'adapter' + adapter.adapter + '/frontend' + (adapter.frontend || 0) + (adapter.name ? ' — ' + adapter.name : '');
+    label.appendChild(input);
+    label.appendChild(span);
+    host.appendChild(label);
+  });
+}
+
+/** Lista de puertos (adaptador/frontend) marcada para el escaneo. */
+function selectedPorts() {
+  const ports = [];
+  const seen = new Set();
+  const push = (value) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    const parts = value.split(':');
+    ports.push({ adapter: int(parts[0], 0), frontend: int(parts[1], 0) });
+  };
+  const select = byId('scan-adapter');
+  if (select && select.value) push(select.value);
+  const host = byId('scan-ports');
+  if (host) {
+    host.querySelectorAll('input[type="checkbox"]:checked').forEach((input) => push(input.value));
+  }
+  if (!ports.length && store.state.settings) {
+    ports.push({
+      adapter: int(store.state.settings.default_adapter, 0),
+      frontend: int(store.state.settings.default_frontend, 0),
+    });
+  }
+  return ports;
+}
+
 export function init(ctx) {
   const form = byId('scan-form');
   if (!form) return { activate() {}, deactivate() {}, destroy() {} };
@@ -229,20 +287,8 @@ export function init(ctx) {
     event.preventDefault();
     const startBtn = byId('scan-start');
     const mode = currentMode();
-    const adapterSelect = byId('scan-adapter');
-    let adapter = 0;
-    let frontend = 0;
-    if (adapterSelect && adapterSelect.value) {
-      const parts = adapterSelect.value.split(':');
-      adapter = int(parts[0], 0);
-      frontend = int(parts[1], 0);
-    } else if (store.state.settings) {
-      adapter = int(store.state.settings.default_adapter, 0);
-      frontend = int(store.state.settings.default_frontend, 0);
-    }
-
     const payload = {
-      adapters: [{ adapter: adapter, frontend: frontend }],
+      adapters: selectedPorts(),
       transponders: null,
       table: null,
       current_only: mode === 'current',
@@ -324,6 +370,7 @@ export function init(ctx) {
       select.appendChild(option);
     });
     if (previous) select.value = previous;
+    renderPorts();
   });
 
   applyModeVisibility();

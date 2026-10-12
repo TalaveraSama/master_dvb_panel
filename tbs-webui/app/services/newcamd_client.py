@@ -41,6 +41,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from .md5crypt import newcamd_password
+
 logger = logging.getLogger(__name__)
 
 MSG_LOGIN = 0xE0
@@ -81,6 +83,10 @@ class NewcamdAccount:
     deskey: str = "0102030405060708091011121314"  # 14 bytes en hexadecimal
     enabled: bool = True
     id: int | None = None
+    # Formato de la contrasena en el login: "md5" (md5_crypt, lo que usa
+    # newcamd/CS378x), "plain" (algunos servidores) o "auto" (prueba md5 y, si el
+    # servidor lo rechaza, reintenta en claro).
+    password_format: str = "auto"
 
     def deskey_bytes(self) -> bytes:
         cleaned = (self.deskey or "").strip().replace(" ", "").replace(":", "")
@@ -304,43 +310,77 @@ class NewcamdClient:
         self._msg_id = 0
 
     # -- conexion -------------------------------------------------------
-    def connect(self) -> NewcamdStatus:
-        """Conecta, hace el handshake y el login. Devuelve el estado."""
-        with self._lock:
-            self.disconnect(update_state=False)
-            self.status = NewcamdStatus(state=STATE_CONNECTING, message="Conectando...")
-        try:
-            sock = socket.create_connection((self.account.host, int(self.account.port)), timeout=self.timeout)
-            sock.settimeout(self.timeout)
-        except OSError as exc:
-            return self._fail(f"No se pudo conectar a {self.account.host}:{self.account.port}: {exc}")
+    def _password_field(self, mode: str) -> bytes:
+        """Campo de contrasena del login segun el modo."""
+        if mode == "plain":
+            return self.account.password.encode("latin-1", "replace")
+        return newcamd_password(self.account.password).encode("latin-1", "replace")
 
+    def _connect_and_login(self, password_field: bytes) -> socket.socket:
+        """Abre el socket, hace el handshake y envia el login.
+
+        Devuelve el socket con la sesion iniciada; lanza `NewcamdAuthError` si el
+        servidor rechaza las credenciales y `NewcamdError`/`OSError` si falla la
+        red o el protocolo.
+        """
+        sock = socket.create_connection((self.account.host, int(self.account.port)), timeout=self.timeout)
+        sock.settimeout(self.timeout)
         try:
-            # OSCam envia 8 bytes de clave inicial (el "key" de la config se
-            # aplica despues con XOR ciclico sobre esos bytes).
-            server_key = self._recv_exact(sock, 8)
-            if len(server_key) < 8:
-                raise NewcamdError("El servidor no envio la clave inicial (8 bytes)")
+            # La referencia de Astra (`newcamd_login_1`) lee **14 bytes** de clave
+            # inicial. Leer menos deja el flujo desincronizado y el login falla.
+            server_key = self._recv_exact(sock, KEY_SIZE)
+            if len(server_key) < KEY_SIZE:
+                raise NewcamdError("El servidor no envio los 14 bytes de clave inicial")
             self._key = derive_triple_des_key(self.account.deskey_bytes(), server_key)
 
-            # Login: usuario + '\0' + contrasena
-            payload = self.account.username.encode("latin-1", "replace") + b"\x00"
-            payload += self.account.password.encode("latin-1", "replace")
+            # Login: usuario + '\0' + contrasena (md5_crypt de 34 caracteres)
+            payload = self.account.username.encode("latin-1", "replace") + b"\x00" + password_field
             self._msg_id = 0
             sock.sendall(build_packet(MSG_LOGIN, payload, self._key, self._msg_id))
             self.status.bytes_out += len(payload)
 
             raw = self._recv_packet(sock)
-            message_type, payload, _body, _ = parse_packet(raw, self._key)
+            message_type, _payload, _body, _ = parse_packet(raw, self._key)
             if message_type == MSG_LOGIN_NAK:
-                raise NewcamdAuthError(
-                    "Login rechazado por el servidor (0xE2). Revisa usuario, contrasena y deskey."
-                )
+                raise NewcamdAuthError("Login rechazado (0xE2): revisa usuario, contrasena y deskey")
             if message_type != MSG_LOGIN_ACK:
                 raise NewcamdAuthError(
-                    "Respuesta de login inesperada (0x%02X). Revisa usuario, contrasena y deskey." % message_type
+                    "Respuesta de login inesperada (0x%02X): revisa usuario, contrasena y deskey" % message_type
                 )
+            return sock
+        except Exception:
+            _close(sock)
+            raise
 
+    def connect(self) -> NewcamdStatus:
+        """Conecta, hace el handshake y el login. Devuelve el estado."""
+        with self._lock:
+            self.disconnect(update_state=False)
+            self.status = NewcamdStatus(state=STATE_CONNECTING, message="Conectando...")
+
+        mode = (self.account.password_format or "auto").lower()
+        modes = ["md5"] if mode == "md5" else ["plain"] if mode == "plain" else ["md5", "plain"]
+        last_error: NewcamdAuthError | None = None
+        sock: socket.socket | None = None
+
+        for candidate in modes:
+            try:
+                sock = self._connect_and_login(self._password_field(candidate))
+                self.status.message = "Conectado y autenticado"
+                logger.info("Newcamd: login aceptado con contrasena en formato %s", candidate)
+                break
+            except NewcamdAuthError as exc:
+                last_error = exc
+                logger.warning("Newcamd: login rechazado con formato %s", candidate)
+            except OSError as exc:
+                return self._fail(f"No se pudo conectar a {self.account.host}:{self.account.port}: {exc}")
+            except NewcamdError as exc:
+                return self._fail(str(exc))
+
+        if sock is None:
+            return self._fail(str(last_error) if last_error else "No se pudo iniciar sesion")
+
+        try:
             # Datos de tarjeta (nos da CAID y providers)
             self._msg_id = (self._msg_id + 1) & 0xFFFF
             sock.sendall(build_packet(MSG_CARD_DATA_REQ, b"", self._key, self._msg_id))
@@ -353,9 +393,6 @@ class NewcamdClient:
                         self.status.providers = payload[14]
             except (NewcamdError, OSError) as exc:
                 logger.debug("Newcamd: sin datos de tarjeta: %s", exc)
-        except NewcamdAuthError as exc:
-            _close(sock)
-            return self._fail(str(exc), state=STATE_ERROR)
         except (NewcamdError, OSError) as exc:
             _close(sock)
             return self._fail(str(exc))

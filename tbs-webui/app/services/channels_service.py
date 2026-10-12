@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Sequence
 
-from sqlalchemy import Select, String, cast, delete, func, or_, select
+from sqlalchemy import Select, String, cast, delete, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from ..dvb.types import ServiceInfo, Transponder
@@ -343,3 +343,85 @@ def list_transponders(
 
 def all_transponders_for_export(db: Session) -> list[TransponderModel]:
     return list(db.execute(select(TransponderModel).order_by(TransponderModel.frequency_khz.asc())).scalars().all())
+
+
+def get_transponder(db: Session, transponder_id: int) -> TransponderModel | None:
+    """Transponder por id (None si no existe o el id no cabe en int64)."""
+    if not is_valid_row_id(transponder_id):
+        return None
+    return db.get(TransponderModel, transponder_id)
+
+
+def _same_identity(
+    db: Session, data: dict[str, Any], exclude_id: int
+) -> TransponderModel | None:
+    """Busca otro transponder con la misma identidad natural."""
+    stmt = select(TransponderModel).where(TransponderModel.id != exclude_id)
+    for field in ("delivery_system", "frequency_khz", "polarization", "symbol_rate_ksps", "stream_id", "plp_id"):
+        value = data.get(field)
+        column = getattr(TransponderModel, field)
+        stmt = stmt.where(column.is_(None) if value is None else column == value)
+    return db.execute(stmt).scalars().first()
+
+
+def update_transponder(db: Session, transponder_id: int, changes: dict[str, Any]) -> TransponderModel | None:
+    """Edita un transponder. Devuelve None si no existe.
+
+    Lanza `ValueError` si los cambios chocan con otro transponder (identidad
+    duplicada); la API lo traduce a 409.
+    """
+    row = get_transponder(db, transponder_id)
+    if row is None:
+        return None
+
+    applied = {key: value for key, value in changes.items() if value is not None}
+    if not applied:
+        return row
+
+    candidate = {
+        "delivery_system": applied.get("delivery_system", row.delivery_system),
+        "frequency_khz": applied.get("frequency_khz", row.frequency_khz),
+        "polarization": applied.get("polarization", row.polarization),
+        "symbol_rate_ksps": applied.get("symbol_rate_ksps", row.symbol_rate_ksps),
+        "stream_id": applied.get("stream_id", row.stream_id),
+        "plp_id": applied.get("plp_id", row.plp_id),
+    }
+    duplicate = _same_identity(db, candidate, exclude_id=transponder_id)
+    if duplicate is not None:
+        raise ValueError(
+            f"Ya existe el transponder #{duplicate.id} con esa identidad "
+            f"({candidate['delivery_system']} {candidate['frequency_khz']} kHz)"
+        )
+
+    for key, value in applied.items():
+        setattr(row, key, value)
+    db.commit()
+    db.refresh(row)
+    logger.info("Transponder #%s editado: %s", transponder_id, ", ".join(sorted(applied)))
+    return row
+
+
+def delete_transponders(db: Session, ids: Sequence[int]) -> tuple[int, int]:
+    """Borra transponders y sus canales. Devuelve (transponders, servicios).
+
+    Los canales se borran explícitamente (además del cascade de la relación) para
+    no depender de `PRAGMA foreign_keys`, que SQLite trae desactivado por defecto.
+    """
+    safe = [int(value) for value in ids if is_valid_row_id(value)]
+    if not safe:
+        return 0, 0
+
+    services = int(
+        db.execute(select(func.count(Service.id)).where(Service.transponder_id.in_(safe))).scalar() or 0
+    )
+    db.execute(delete(Service).where(Service.transponder_id.in_(safe)))
+    db.flush()
+    result = db.execute(delete(TransponderModel).where(TransponderModel.id.in_(safe)))
+    db.commit()
+    return int(result.rowcount or 0), services
+
+
+def list_frontends_for_tuning(db: Session) -> list[int]:
+    """Identificadores de adaptador que tienen transponders guardados."""
+    rows = db.execute(select(TransponderModel.id)).scalars().all()
+    return sorted({int(value) for value in rows})

@@ -426,6 +426,15 @@
                 <select id="scan-adapter"></select>
               </div>
               <div class="field">
+                <span class="label">Puertos adicionales (varios sintonizadores)</span>
+                <div id="scan-ports" class="ports-list">
+                  <span class="muted small">Cargando puertos…</span>
+                </div>
+                <span class="muted small">
+                  Marca varios puertos para repartir el escaneo entre ellos (se usan uno tras otro).
+                </span>
+              </div>
+              <div class="field">
                 <span class="label">Origen del escaneo</span>
                 <div class="radios">
                   <label class="check"><input id="scan-mode-current" type="radio" name="scan-mode" value="current" checked><span>Transponder actual</span></label>
@@ -614,21 +623,31 @@
         <section class="view" data-view="transponders" aria-labelledby="h-transponders" hidden>
           <header class="view-head">
             <h1 id="h-transponders">Transponders</h1>
-            <p class="muted">Transponders guardados en la base de datos, con el número de servicios asociados.</p>
+            <p class="muted">
+              Transponders guardados. Puedes editarlos, sintonizarlos en el <strong>puerto de
+              sintonizador</strong> que elijas y borrarlos.
+            </p>
           </header>
 
           <article class="card">
-            <div class="toolbar">
+            <div class="card-head">
+              <h2>Puerto de sintonizador</h2>
+              <span class="muted small" id="tp-frontend-info">—</span>
+            </div>
+            <div class="toolbar table-actions">
+              <div class="field field-inline">
+                <label for="tp-adapter">Adaptador / frontend</label>
+                <select id="tp-adapter"></select>
+              </div>
               <div class="field field-inline">
                 <label for="tp-search">Buscar</label>
                 <input id="tp-search" type="search" placeholder="frecuencia, satélite, sistema…" autocomplete="off">
               </div>
-              <div class="toolbar-actions">
-                <button id="tp-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar</button>
-              </div>
+              <button id="tp-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar</button>
               <span class="toolbar-spacer"></span>
               <span class="muted small"><strong id="tp-count">0</strong> en total</span>
             </div>
+
             <div class="table-wrap">
               <table class="table">
                 <caption class="sr-only">Listado de transponders</caption>
@@ -643,14 +662,93 @@
                     <th scope="col">Modulación</th>
                     <th scope="col">Satélite</th>
                     <th scope="col">Servicios</th>
+                    <th scope="col">Última señal</th>
+                    <th scope="col" class="col-actions">Acciones</th>
                   </tr>
                 </thead>
                 <tbody id="tp-body">
-                  <tr><td colspan="9" class="muted center">Cargando…</td></tr>
+                  <tr><td colspan="11" class="muted center">Cargando…</td></tr>
                 </tbody>
               </table>
             </div>
             <p class="muted small" id="tp-status" role="status" aria-live="polite"></p>
+          </article>
+
+          <article class="card" id="tp-editor" hidden>
+            <div class="card-head">
+              <h2 id="tp-editor-title">Editar transponder</h2>
+              <span class="muted small" id="tp-editor-sub"></span>
+            </div>
+            <form id="tp-form">
+              <div class="form-grid">
+                <div class="field">
+                  <label for="tp-f-system">Sistema</label>
+                  <select id="tp-f-system">
+                    <option value="DVB-S2">DVB-S2</option>
+                    <option value="DVB-S">DVB-S</option>
+                    <option value="DVB-T2">DVB-T2</option>
+                    <option value="DVB-T">DVB-T</option>
+                    <option value="DVB-C">DVB-C</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="tp-f-frequency">Frecuencia (kHz)</label>
+                  <input id="tp-f-frequency" type="number" min="1" step="1" required>
+                </div>
+                <div class="field">
+                  <label for="tp-f-symbol">Symbol rate (ksps)</label>
+                  <input id="tp-f-symbol" type="number" min="1" step="1">
+                </div>
+                <div class="field">
+                  <label for="tp-f-pol">Polaridad</label>
+                  <select id="tp-f-pol">
+                    <option value="">—</option>
+                    <option value="H">H</option>
+                    <option value="V">V</option>
+                    <option value="L">L</option>
+                    <option value="R">R</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="tp-f-fec">FEC</label>
+                  <input id="tp-f-fec" type="text" maxlength="16" placeholder="3/4, 5/6, AUTO…">
+                </div>
+                <div class="field">
+                  <label for="tp-f-mod">Modulación</label>
+                  <input id="tp-f-mod" type="text" maxlength="16" placeholder="8PSK, QPSK…">
+                </div>
+                <div class="field">
+                  <label for="tp-f-sat">Satélite / posición</label>
+                  <input id="tp-f-sat" type="text" maxlength="32" placeholder="19.2E">
+                </div>
+                <div class="field">
+                  <label for="tp-f-rolloff">Roll-off</label>
+                  <input id="tp-f-rolloff" type="text" maxlength="8" placeholder="0.35">
+                </div>
+                <div class="field">
+                  <label for="tp-f-pilot">Pilot</label>
+                  <input id="tp-f-pilot" type="text" maxlength="16" placeholder="AUTO">
+                </div>
+                <div class="field">
+                  <label for="tp-f-inversion">Inversión</label>
+                  <input id="tp-f-inversion" type="text" maxlength="16" value="AUTO">
+                </div>
+                <div class="field">
+                  <label for="tp-f-stream">Stream ID (multistream)</label>
+                  <input id="tp-f-stream" type="number" min="0" max="255" placeholder="opcional">
+                </div>
+                <div class="field">
+                  <label for="tp-f-plp">PLP ID</label>
+                  <input id="tp-f-plp" type="number" min="0" max="255" placeholder="opcional">
+                </div>
+              </div>
+              <div class="form-actions">
+                <button id="tp-save" type="submit" class="btn btn-primary">Guardar cambios</button>
+                <button id="tp-tune" type="button" class="btn btn-ghost">Sintonizar en el puerto elegido</button>
+                <button id="tp-cancel" type="button" class="btn btn-ghost">Cancelar</button>
+                <span id="tp-result" class="muted small" role="status"></span>
+              </div>
+            </form>
           </article>
         </section>
 
@@ -782,6 +880,24 @@
           <div id="newcamd-disabled" class="callout callout-warn" hidden>
             Newcamd está deshabilitado en el servidor (TBS_NEWCAMD_ENABLED=0).
           </div>
+
+          <article class="card" id="oscam-card">
+            <div class="card-head">
+              <h2>Tarjeta y OSCam (estado real)</h2>
+              <span class="muted small" id="oscam-summary">Consultando…</span>
+            </div>
+            <div class="toolbar table-actions">
+              <button id="oscam-refresh" type="button" class="btn btn-ghost btn-sm">↻ Actualizar estado</button>
+              <span class="toolbar-spacer"></span>
+              <span class="muted small mono" id="oscam-url"></span>
+            </div>
+            <div id="oscam-body" class="muted small">Cargando estado de OSCam…</div>
+            <div class="callout callout-warn" style="margin-top:0.8rem">
+              <strong>Importante:</strong> OSCam no usa DES estándar en Newcamd (aplica <code>doPC1()</code> y un
+              DES propio), así que un cliente en Python no puede autenticarse contra él. El descifrado lo hace
+              OSCam/Astra/TVHeadend; este panel controla el sintonizador y muestra el estado real de la tarjeta.
+            </div>
+          </article>
 
           <article class="card">
             <div class="card-head">

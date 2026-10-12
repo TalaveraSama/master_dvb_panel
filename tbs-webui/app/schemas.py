@@ -330,7 +330,7 @@ class AdapterRef(BaseModel):
 
 
 class ScanStartRequest(BaseModel):
-    adapters: list[AdapterRef] = Field(default_factory=lambda: [AdapterRef()])
+    adapters: list[AdapterRef] = Field(default_factory=lambda: [AdapterRef()], min_length=1, max_length=8)
     transponders: list[TransponderIn] | None = None
     table: str | None = None  # nombre del bundle de /usr/share/dvb
     current_only: bool = False  # escanear sólo el transponder sintonizado
@@ -439,6 +439,8 @@ class ChannelPatch(BaseModel):
 
 
 class TransponderOut(BaseModel):
+    """Transponder guardado, con todos los campos editables desde la vista."""
+
     id: int
     delivery_system: str
     frequency_khz: int
@@ -447,17 +449,78 @@ class TransponderOut(BaseModel):
     fec: str | None = None
     modulation: str | None = None
     bandwidth_mhz: int | None = None
+    inversion: str = "AUTO"
+    rolloff: str | None = None
+    pilot: str | None = None
+    stream_id: int | None = None
+    plp_id: int | None = None
     sat_position: str | None = None
     last_signal_percent: float | None = None
     last_snr_db: float | None = None
     label: str = ""
     services_count: int = 0
-    updated_at: datetime
+    updated_at: datetime | None = None
 
 
 class TransponderListOut(BaseModel):
     total: int
     items: list[TransponderOut]
+
+
+class TransponderPatch(BaseModel):
+    """Edición parcial de un transponder guardado.
+
+    Sólo se aplican los campos enviados. La identidad natural (sistema,
+    frecuencia, polarización, symbol rate, stream/PLP) debe seguir siendo única:
+    la API responde 409 si ya existe otro transponder con esos datos.
+    """
+
+    delivery_system: DeliverySystem | None = None
+    frequency_khz: int | None = Field(default=None, gt=0, le=100_000_000)
+    symbol_rate_ksps: int | None = Field(default=None, gt=0, le=100_000)
+    polarization: Polarization | None = None
+    fec: str | None = None
+    modulation: str | None = None
+    bandwidth_mhz: int | None = Field(default=None, gt=0, le=64)
+    inversion: str | None = None
+    rolloff: str | None = None
+    pilot: str | None = None
+    stream_id: int | None = Field(default=None, ge=0, le=255)
+    plp_id: int | None = Field(default=None, ge=0, le=255)
+    sat_position: str | None = Field(default=None, max_length=32)
+
+    @model_validator(mode="after")
+    def _al_menos_uno(self) -> "TransponderPatch":
+        if not self.model_dump(exclude_none=True):
+            raise ValueError("Envía al menos un campo para editar")
+        return self
+
+
+class TransponderTuneRequest(BaseModel):
+    """Sintoniza un transponder guardado en el puerto de sintonizador indicado."""
+
+    adapter: int = Field(default=0, ge=0, le=31)
+    frontend: int = Field(default=0, ge=0, le=7)
+    use_lnb: bool = True
+    lnb_low_khz: int = Field(default=9750, ge=0, le=30000)
+    lnb_high_khz: int = Field(default=10600, ge=0, le=30000)
+    lnb_threshold_khz: int = Field(default=11700, ge=0, le=30000)
+    lock_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    tone_22k: bool | None = None
+    voltage: str | None = None
+    diseqc: str | None = None
+
+
+class MultiScanRequest(BaseModel):
+    """Escaneo sobre varios puertos de sintonizador a la vez."""
+
+    adapters: list[int] = Field(default_factory=list, min_length=1, max_length=8)
+    transponders: list[TransponderIn] | None = None
+    table: str | None = None
+    current_only: bool = False
+    clear_existing: bool = False
+    lock_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    dwell_seconds: float = Field(default=8.0, gt=0, le=60)
 
 
 # ---------------------------------------------------------------------------
