@@ -700,3 +700,34 @@ class LogListOut(BaseModel):
 StatusOut.model_rebuild()
 TuneResult.model_rebuild()
 ScanStatusOut.model_rebuild()
+
+
+class NewcamdProfileTestOut(BaseModel):
+    """Resultado de comprobar un perfil Newcamd (solo conectividad TCP)."""
+
+    ok: bool
+    reachable: bool
+    host: str
+    port: int
+    latency_ms: int | None = None
+    detail: str = ""
+    note: str = ""
+
+
+class NewcamdConfigOut(BaseModel):
+    """Configuracion Lua que se generaria para el motor nativo."""
+
+    path: str
+    exists: bool
+    profiles: int
+    lua: str
+    current: str | None = None
+
+
+class NewcamdApplyOut(BaseModel):
+    """Resultado de aplicar o revertir la configuracion del motor."""
+
+    ok: bool
+    path: str
+    backup: str | None = None
+    detail: str = ""

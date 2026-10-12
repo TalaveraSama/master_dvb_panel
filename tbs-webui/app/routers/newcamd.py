@@ -32,6 +32,9 @@ from ..models import NewcamdAccount as NewcamdAccountModel
 from ..schemas import (
     NewcamdAccountIn,
     NewcamdAccountOut,
+    NewcamdApplyOut,
+    NewcamdConfigOut,
+    NewcamdProfileTestOut,
     NewcamdActionOut,
     NewcamdEcmIn,
     NewcamdEcmOut,
@@ -42,6 +45,7 @@ from ..schemas import (
     OkOut,
 )
 from ..services import newcamd_manager as mgr
+from ..services import newcamd_profiles as perfiles
 from ..services import oscam_status as oscam
 
 logger = logging.getLogger(__name__)
@@ -308,3 +312,280 @@ def send_ecm(account_id: int, payload: NewcamdEcmIn, db: DbSession, manager: Man
         account_id=row.id,
         detail="ECM enviado" if sent else "El socket rechazó el envío",
     )
+
+
+# ===========================================================================
+# Perfiles Newcamd para el motor nativo (administracion desde Python)
+# ===========================================================================
+
+
+def _profile_out(row: NewcamdAccountModel, settings: AppSettings) -> NewcamdAccountOut:
+    """Respuesta de un perfil sin secretos (solo si estan configurados)."""
+    return NewcamdAccountOut(
+        id=row.id,
+        name=row.name,
+        host=row.host,
+        port=row.port,
+        username=row.username or "",
+        deskey=row.deskey or "",
+        enabled=bool(row.enabled),
+        auto_connect=bool(row.auto_connect),
+        password_set=bool(row.password_enc),
+        notes=row.notes or "",
+        created_at=row.created_at.isoformat() if row.created_at else "",
+        updated_at=row.updated_at.isoformat() if row.updated_at else "",
+    )
+
+
+def _profile_from_row(row: NewcamdAccountModel, settings: AppSettings) -> perfiles.NewcamdProfile:
+    """Perfil (con secretos en claro, solo en memoria) a partir de la fila."""
+    return perfiles.NewcamdProfile(
+        name=row.name,
+        host=row.host,
+        port=int(row.port),
+        username=row.username or "",
+        password=perfiles.decrypt_secret(row.password_enc, settings),
+        des_key=perfiles.decrypt_secret(row.deskey_enc, settings) or row.deskey or "",
+        timeout=int(getattr(row, "timeout_s", 8) or 8),
+        disable_emm=bool(getattr(row, "disable_emm", True)),
+    )
+
+
+@router.get("/profiles", response_model=dict)
+def list_profiles(db: DbSession, settings: AppSettings) -> dict:
+    """Perfiles Newcamd **sin secretos** (solo si estan configurados)."""
+    filas = db.execute(select(NewcamdAccountModel).order_by(NewcamdAccountModel.name)).scalars().all()
+    items = []
+    for row in filas:
+        perfil = _profile_from_row(row, settings)
+        datos = perfil.public_dict()
+        datos["id"] = row.id
+        datos["enabled"] = bool(row.enabled)
+        datos["notes"] = row.notes
+        items.append(datos)
+    return {
+        "total": len(items),
+        "items": items,
+        "engine": {
+            "config_path": str(_config_path(settings)),
+            "native_newcamd": True,
+            "description": (
+                "Python administra los perfiles; el motor nativo (Astra/Forkcastra) "
+                "conecta por Newcamd, pide ECM y descifra con FFdecsa/libdvbcsa."
+            ),
+        },
+    }
+
+
+def _config_path(settings: AppSettings):
+    from pathlib import Path
+
+    ruta = getattr(settings, "engine_config_path", None) or "stream.lua"
+    ruta = str(ruta)
+    if not ruta.startswith("/"):
+        from pathlib import Path as _Path
+
+        ruta = str(_Path(getattr(settings, "data_dir", ".")) / ruta)
+    return Path(ruta)
+
+
+@router.get("/config", response_model=NewcamdConfigOut)
+def get_config(db: DbSession, settings: AppSettings) -> NewcamdConfigOut:
+    """Configuracion Lua que se generaria con los perfiles actuales."""
+    filas = db.execute(
+        select(NewcamdAccountModel).where(NewcamdAccountModel.enabled.is_(True)).order_by(NewcamdAccountModel.name)
+    ).scalars().all()
+    perfiles_lua = []
+    for row in filas:
+        perfil = _profile_from_row(row, settings)
+        try:
+            perfil.validate()
+        except perfiles.ProfileError as exc:
+            logger.warning("Perfil %s incompleto: %s", row.name, exc)
+            continue
+        perfiles_lua.append(perfil)
+
+    ruta = _config_path(settings)
+    existente = None
+    if ruta.is_file():
+        try:
+            existente = ruta.read_text(encoding="utf-8", errors="replace")[:2000]
+        except OSError:
+            existente = None
+    return NewcamdConfigOut(
+        path=str(ruta),
+        exists=ruta.is_file(),
+        profiles=len(perfiles_lua),
+        lua=perfiles.render_config(perfiles_lua, []),
+        current=existente,
+    )
+
+
+@router.post("/config/apply", response_model=NewcamdApplyOut)
+def apply_config(db: DbSession, settings: AppSettings) -> NewcamdApplyOut:
+    """Genera e instala la configuracion del motor (con copia de seguridad)."""
+    if not settings.newcamd_enabled:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Newcamd esta deshabilitado (TBS_NEWCAMD_ENABLED=0)",
+        )
+    filas = db.execute(
+        select(NewcamdAccountModel).where(NewcamdAccountModel.enabled.is_(True)).order_by(NewcamdAccountModel.name)
+    ).scalars().all()
+
+    validos: list[perfiles.NewcamdProfile] = []
+    for row in filas:
+        perfil = _profile_from_row(row, settings)
+        try:
+            perfil.validate()
+        except perfiles.ProfileError as exc:
+            raise HTTPException(
+                status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"El perfil '{row.name}' no es valido: {exc}",
+            ) from exc
+        validos.append(perfil)
+
+    lua = perfiles.render_config(validos, [])
+    resultado = perfiles.apply_config(_config_path(settings), lua)
+    if not resultado.ok:
+        raise HTTPException(status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail=resultado.detail)
+    return NewcamdApplyOut(**resultado.to_dict())
+
+
+@router.post("/config/rollback", response_model=NewcamdApplyOut)
+def rollback(settings: AppSettings) -> NewcamdApplyOut:
+    """Restaura la configuracion anterior del motor."""
+    resultado = perfiles.rollback_config(_config_path(settings))
+    if not resultado.ok:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=resultado.detail)
+    return NewcamdApplyOut(**resultado.to_dict())
+
+
+@router.post("/profiles/{account_id}/test", response_model=NewcamdProfileTestOut)
+def test_profile(
+    account_id: int,
+    db: DbSession,
+    settings: AppSettings,
+    timeout: float = Query(default=3.0, gt=0, le=30),
+) -> NewcamdProfileTestOut:
+    """Comprueba que host:puerto aceptan TCP.
+
+    Solo valida la red: **no** confirma login Newcamd, tarjeta ni ECM. Esa
+    validacion la reporta el motor nativo (pestana Newcamd, estado de OSCam).
+    """
+    row = _get_row(db, account_id)
+    perfil = _profile_from_row(row, settings)
+    if not perfil.host:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail="El perfil no tiene host")
+    resultado = perfiles.test_tcp_connection(perfil.host, perfil.port, timeout=timeout)
+    return NewcamdProfileTestOut(
+        ok=bool(resultado.get("reachable")),
+        reachable=bool(resultado.get("reachable")),
+        host=perfil.host,
+        port=perfil.port,
+        latency_ms=resultado.get("latency_ms"),
+        detail=resultado.get("detail") or resultado.get("error") or "",
+        note="TCP solamente: el login Newcamd y el ECM los valida el motor nativo.",
+    )
+
+
+@router.post("/profiles", response_model=NewcamdAccountOut, status_code=http_status.HTTP_201_CREATED)
+def create_profile(
+    payload: NewcamdAccountIn, db: DbSession, settings: AppSettings
+) -> NewcamdAccountOut:
+    """Crea un perfil guardando contrasena y DES key **cifradas** (AES-GCM)."""
+    if not settings.newcamd_enabled:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Newcamd esta deshabilitado (TBS_NEWCAMD_ENABLED=0)",
+        )
+    existente = db.execute(
+        select(NewcamdAccountModel).where(NewcamdAccountModel.name == payload.name)
+    ).scalars().first()
+    if existente is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT, detail="Ya existe un perfil con ese nombre"
+        )
+
+    perfil = perfiles.NewcamdProfile(
+        name=payload.name,
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=payload.password or "",
+        des_key=(payload.deskey or "").lower(),
+        timeout=int(getattr(payload, "timeout_s", 8) or 8),
+        disable_emm=bool(getattr(payload, "disable_emm", True)),
+    )
+    try:
+        perfil.validate()
+    except perfiles.ProfileError as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    row = NewcamdAccountModel(
+        name=perfil.name,
+        host=perfil.host,
+        port=perfil.port,
+        username=perfil.username,
+        password_enc=perfiles.encrypt_secret(perfil.password, settings),
+        deskey=perfil.des_key,
+        deskey_enc=perfiles.encrypt_secret(perfil.des_key, settings),
+        timeout_s=perfil.timeout,
+        disable_emm=perfil.disable_emm,
+        enabled=bool(payload.enabled),
+        auto_connect=bool(payload.auto_connect),
+        notes=payload.notes,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _profile_out(row, settings)
+
+
+@router.put("/profiles/{account_id}", response_model=NewcamdAccountOut)
+def update_profile(
+    account_id: int, payload: NewcamdAccountIn, db: DbSession, settings: AppSettings
+) -> NewcamdAccountOut:
+    """Edita un perfil; los secretos vacios se conservan."""
+    row = _get_row(db, account_id)
+    perfil_actual = _profile_from_row(row, settings)
+    perfil = perfiles.NewcamdProfile(
+        name=payload.name,
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=payload.password or perfil_actual.password,
+        des_key=(payload.deskey or perfil_actual.des_key or "").lower(),
+        timeout=int(getattr(payload, "timeout_s", perfil_actual.timeout) or 8),
+        disable_emm=bool(getattr(payload, "disable_emm", perfil_actual.disable_emm)),
+    )
+    try:
+        perfil.validate()
+    except perfiles.ProfileError as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    row.name = perfil.name
+    row.host = perfil.host
+    row.port = perfil.port
+    row.username = perfil.username
+    row.password_enc = perfiles.encrypt_secret(perfil.password, settings)
+    row.deskey = perfil.des_key
+    row.deskey_enc = perfiles.encrypt_secret(perfil.des_key, settings)
+    row.timeout_s = perfil.timeout
+    row.disable_emm = perfil.disable_emm
+    row.enabled = bool(payload.enabled)
+    row.auto_connect = bool(payload.auto_connect)
+    row.notes = payload.notes
+    db.commit()
+    db.refresh(row)
+    return _profile_out(row, settings)
+
+
+@router.delete("/profiles/{account_id}", response_model=OkOut)
+def delete_profile(account_id: int, db: DbSession) -> OkOut:
+    """Borra un perfil (los secretos cifrados desaparecen con el)."""
+    row = _get_row(db, account_id)
+    db.execute(delete(NewcamdAccountModel).where(NewcamdAccountModel.id == row.id))
+    db.commit()
+    return OkOut(ok=True, detail=f"Perfil '{row.name}' borrado")
+
