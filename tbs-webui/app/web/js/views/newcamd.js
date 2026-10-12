@@ -1,9 +1,9 @@
 /**
  * TBS WebUI - vista Newcamd.
  *
- * Gestiona cuentas de servidores Newcamd propios o autorizados: alta, edición,
- * borrado, prueba de conexión (login), conexión/desconexión y estado en vivo
- * (ECM enviados, control words recibidos, bytes y último CW).
+ * Gestiona **varias** cuentas de servidores Newcamd propios o autorizados:
+ * alta, edición, duplicado, habilitar/deshabilitar, borrado, prueba de conexión
+ * y conexión/desconexión, con estado en vivo (ECM, control words, CAID).
  *
  * AVISO: úsalo sólo con servidores de tu propiedad o para los que tengas
  * autorización expresa.
@@ -15,51 +15,82 @@ import { byId, esc, setBusy } from '../utils.js';
 
 let refreshTimer = null;
 let editingId = null;
+let accounts = [];
 
 const STATE_LABEL = {
-  disconnected: ['Desconectado', 'badge', ''],
-  connecting: ['Conectando…', 'badge badge-warn', ''],
-  connected: ['Conectado', 'badge badge-ok', ''],
-  logged_in: ['Sesión iniciada', 'badge badge-ok', ''],
-  error: ['Error', 'badge badge-err', ''],
+  disconnected: ['Desconectado', 'badge'],
+  connecting: ['Conectando…', 'badge badge-warn'],
+  connected: ['Conectado', 'badge badge-ok'],
+  logged_in: ['Sesión iniciada', 'badge badge-ok'],
+  error: ['Error', 'badge badge-err'],
 };
 
+const DEFAULT_DESKEY = '0102030405060708091011121314';
+
+// ---------------------------------------------------------------------------
+// Pintado
+// ---------------------------------------------------------------------------
 function stateCell(item) {
   const status = item.status || {};
-  const [label, css] = STATE_LABEL[status.state] || [status.state || '—', 'badge', ''];
-  const title = status.last_error || status.message || '';
-  const hint = title ? ` title="${esc(title)}"` : '';
+  const [label, css] = STATE_LABEL[status.state] || [status.state || '—', 'badge'];
+  const detail = status.last_error || status.message || '';
+  const title = detail ? ` title="${esc(detail)}"` : '';
   const dot = status.state === 'logged_in' ? '●' : status.state === 'error' ? '■' : '○';
-  return `<span class="${css}"${hint}>${dot} ${esc(label)}</span>`;
+  return `<span class="${css}"${title}>${dot} ${esc(label)}</span>`;
+}
+
+function renderSummary(list) {
+  const host = byId('newcamd-summary');
+  if (!host) return;
+  if (!list.length) {
+    host.textContent = 'sin cuentas';
+    return;
+  }
+  const connected = list.filter((item) => (item.status || {}).state === 'logged_in').length;
+  const enabled = list.filter((item) => item.enabled).length;
+  host.textContent = `${list.length} cuenta(s) · ${enabled} activa(s) · ${connected} conectada(s)`;
 }
 
 function renderRows(list) {
   const tbody = byId('newcamd-rows');
   if (!tbody) return;
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">No hay cuentas Newcamd configuradas.</td></tr>';
+    tbody.innerHTML =
+      '<tr><td colspan="6" class="muted">No hay cuentas Newcamd. Pulsa «＋ Nueva cuenta» para añadir la primera.</td></tr>';
     return;
   }
   tbody.innerHTML = list
     .map((item) => {
       const status = item.status || {};
       const connected = status.state === 'logged_in';
-      return `<tr data-id="${item.id}">
+      const badges = [];
+      if (item.auto_connect) badges.push('<span class="badge badge-ok" title="Conectar al arrancar">auto</span>');
+      if (!item.enabled) badges.push('<span class="badge badge-warn">deshabilitada</span>');
+      const cw = status.last_cw ? ` <span class="muted">${esc(String(status.last_cw).slice(0, 8))}…</span>` : '';
+      const caid = status.caid ? ` <span class="muted">CAID ${Number(status.caid).toString(16)}</span>` : '';
+      return `<tr data-id="${item.id}"${item.enabled ? '' : ' class="row-disabled"'}>
         <td>${stateCell(item)}</td>
-        <td>${esc(item.name)}${item.auto_connect ? ' <span class="muted small" title="Conectar al arrancar">auto</span>' : ''}${
-          item.enabled ? '' : ' <span class="badge badge-warn">deshabilitada</span>'
-        }</td>
+        <td>
+          <strong>${esc(item.name)}</strong> ${badges.join(' ')}
+          ${item.notes ? `<div class="muted small">${esc(item.notes)}</div>` : ''}
+        </td>
         <td class="mono small">${esc(item.host)}:${item.port}</td>
-        <td class="mono small">${esc(item.username || '—')}</td>
+        <td class="mono small">${esc(item.username || '—')}${
+          item.password_set ? '' : ' <span class="badge badge-warn" title="Sin contraseña guardada">sin clave</span>'
+        }</td>
         <td class="mono small" title="ECM enviados / control words recibidos">${status.ecm_sent || 0} / ${
           status.cw_received || 0
-        }${status.last_cw ? ` <span class="muted">${esc(status.last_cw.slice(0, 8))}…</span>` : ''}</td>
+        }${cw}${caid}</td>
         <td class="col-actions">
-          <button type="button" class="btn btn-ghost btn-sm" data-action="${connected ? 'disconnect' : 'connect'}">${
-            connected ? 'Desconectar' : 'Conectar'
-          }</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-action="${connected ? 'disconnect' : 'connect'}" ${
+            item.enabled ? '' : 'disabled'
+          }>${connected ? 'Desconectar' : 'Conectar'}</button>
           <button type="button" class="btn btn-ghost btn-sm" data-action="test">Probar</button>
           <button type="button" class="btn btn-ghost btn-sm" data-action="edit">Editar</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-action="duplicate" title="Duplicar cuenta">Duplicar</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-action="toggle" title="${
+            item.enabled ? 'Deshabilitar' : 'Habilitar'
+          }">${item.enabled ? 'Desactivar' : 'Activar'}</button>
           <button type="button" class="btn btn-ghost btn-sm btn-danger" data-action="delete">Borrar</button>
         </td>
       </tr>`;
@@ -70,42 +101,54 @@ function renderRows(list) {
 async function load({ quiet = false } = {}) {
   try {
     const data = await api.newcamdAccounts();
+    accounts = data.items || [];
     const disabled = byId('newcamd-disabled');
     if (disabled) disabled.hidden = Boolean(data.enabled);
     const newButton = byId('newcamd-new');
     if (newButton) newButton.disabled = !data.enabled;
-    renderRows(data.items || []);
+    renderSummary(accounts);
+    renderRows(accounts);
   } catch (error) {
     if (!quiet) toast(error.detail || 'No se pudieron cargar las cuentas Newcamd', 'error');
     const tbody = byId('newcamd-rows');
-    if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="muted">${esc(error.detail || 'Error al cargar')}</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6" class="muted">${esc(error.detail || 'Error al cargar')}</td></tr>`;
+    }
   }
 }
 
-function openForm(item = null) {
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+function openEditor(item = null) {
   editingId = item ? item.id : null;
-  const form = byId('newcamd-form');
-  if (!form) return;
-  form.hidden = false;
+  const card = byId('newcamd-editor');
+  const title = byId('newcamd-editor-title');
+  if (!card) return;
+  card.hidden = false;
+  if (title) title.textContent = item ? `Editar «${item.name}»` : 'Nueva cuenta';
+
   byId('nc-name').value = item ? item.name : '';
   byId('nc-host').value = item ? item.host : '';
   byId('nc-port').value = item ? item.port : 50001;
   byId('nc-user').value = item ? item.username || '' : '';
-  byId('nc-pass').value = '';
-  byId('nc-pass').placeholder = item && item.password_set ? '(sin cambios)' : 'contraseña';
-  byId('nc-deskey').value = item ? item.deskey : '0102030405060708091011121314';
+  const pass = byId('nc-pass');
+  pass.value = '';
+  pass.placeholder = item && item.password_set ? '(sin cambios)' : 'contraseña';
+  byId('nc-deskey').value = item ? item.deskey : DEFAULT_DESKEY;
   byId('nc-enabled').checked = item ? Boolean(item.enabled) : true;
   byId('nc-auto').checked = item ? Boolean(item.auto_connect) : false;
   byId('nc-notes').value = item ? item.notes || '' : '';
   byId('nc-result').textContent = '';
   byId('nc-save').textContent = item ? 'Guardar cambios' : 'Crear cuenta';
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   byId('nc-name').focus();
 }
 
-function closeForm() {
+function closeEditor() {
   editingId = null;
-  const form = byId('newcamd-form');
-  if (form) form.hidden = true;
+  const card = byId('newcamd-editor');
+  if (card) card.hidden = true;
 }
 
 function formPayload() {
@@ -125,6 +168,10 @@ function formPayload() {
 async function submit(event) {
   event.preventDefault();
   const payload = formPayload();
+  if (!payload.name || !payload.host) {
+    byId('nc-result').textContent = '✖ El nombre y el servidor son obligatorios';
+    return;
+  }
   const button = byId('nc-save');
   setBusy(button, true, 'Guardando…');
   try {
@@ -135,10 +182,10 @@ async function submit(event) {
       await api.newcamdCreate(payload);
       toast('Cuenta creada', 'ok');
     }
-    closeForm();
+    closeEditor();
     await load();
   } catch (error) {
-    byId('nc-result').textContent = error.detail || 'No se pudo guardar';
+    byId('nc-result').textContent = '✖ ' + (error.detail || 'No se pudo guardar');
     toast(error.detail || 'No se pudo guardar la cuenta', 'error');
   } finally {
     setBusy(button, false);
@@ -149,17 +196,25 @@ async function testForm() {
   const payload = formPayload();
   const button = byId('nc-test');
   const result = byId('nc-result');
+  if (!payload.host) {
+    result.textContent = '✖ Indica el servidor';
+    return;
+  }
   setBusy(button, true, 'Probando…');
   result.textContent = '';
   try {
-    const body = Object.assign({}, payload);
-    if (editingId && !body.password) delete body.password;
-    if (editingId) body.id = editingId;
-    delete body.enabled;
-    delete body.auto_connect;
-    delete body.notes;
+    const body = {
+      host: payload.host,
+      port: payload.port,
+      username: payload.username,
+      deskey: payload.deskey,
+    };
+    if (payload.password) body.password = payload.password;
+    if (editingId && !payload.password) body.id = editingId;
     const data = await api.newcamdTest(body);
-    result.textContent = data.ok ? '✔ ' + data.message : '✖ ' + data.message;
+    const text = data.ok ? '✔ ' + data.message : '✖ ' + data.message;
+    result.textContent =
+      text + (data.details && data.details.caid ? ` · CAID ${Number(data.details.caid).toString(16)}` : '');
     toast(data.message, data.ok ? 'ok' : 'error');
   } catch (error) {
     result.textContent = '✖ ' + (error.detail || 'Error de conexión');
@@ -169,6 +224,9 @@ async function testForm() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Acciones de fila
+// ---------------------------------------------------------------------------
 async function onRowClick(event) {
   const button = event.target.closest('button[data-action]');
   if (!button) return;
@@ -176,35 +234,79 @@ async function onRowClick(event) {
   if (!row) return;
   const id = Number(row.dataset.id);
   const action = button.dataset.action;
+  const item = accounts.find((entry) => entry.id === id);
 
   if (action === 'edit') {
-    const data = await api.newcamdAccounts();
-    const item = (data.items || []).find((entry) => entry.id === id);
-    if (item) openForm(item);
+    if (item) openEditor(item);
     return;
   }
+
+  if (action === 'duplicate') {
+    if (!item) return;
+    openEditor({
+      ...item,
+      id: null,
+      name: `${item.name}-copia`,
+      notes: item.notes || 'copia',
+    });
+    byId('nc-pass').placeholder = 'contraseña de la copia';
+    return;
+  }
+
   if (action === 'delete') {
     const ok = await confirmDialog({
       title: 'Borrar cuenta Newcamd',
-      message: '¿Quieres borrar esta cuenta? Se cerrará su conexión.',
+      message: `¿Borrar la cuenta «${item ? item.name : id}»? Se cerrará su conexión.`,
       confirmLabel: 'Borrar',
     });
     if (!ok) return;
     try {
       await api.newcamdDelete(id);
       toast('Cuenta borrada', 'ok');
+      if (editingId === id) closeEditor();
       await load();
     } catch (error) {
       toast(error.detail || 'No se pudo borrar', 'error');
     }
     return;
   }
+
+  if (action === 'toggle') {
+    if (!item) return;
+    setBusy(button, true, item.enabled ? 'Desactivando…' : 'Activando…');
+    try {
+      await api.newcamdUpdate(id, {
+        name: item.name,
+        host: item.host,
+        port: item.port,
+        username: item.username || '',
+        deskey: item.deskey,
+        enabled: !item.enabled,
+        auto_connect: item.auto_connect,
+        notes: item.notes || null,
+      });
+      toast(item.enabled ? 'Cuenta deshabilitada' : 'Cuenta habilitada', 'ok');
+      await load({ quiet: true });
+    } catch (error) {
+      toast(error.detail || 'No se pudo cambiar el estado', 'error');
+    } finally {
+      setBusy(button, false);
+    }
+    return;
+  }
+
   if (action === 'connect' || action === 'disconnect') {
     setBusy(button, true, action === 'connect' ? 'Conectando…' : 'Cerrando…');
     try {
       if (action === 'connect') {
-        await api.newcamdConnect(id);
-        toast('Sesión Newcamd iniciada', 'ok');
+        const result = await api.newcamdConnect(id);
+        const status = result.status || {};
+        toast(
+          status.state === 'logged_in'
+            ? `Sesión iniciada${status.caid ? ` (CAID ${Number(status.caid).toString(16)})` : ''}`
+            : status.message || 'No se pudo iniciar la sesión',
+          status.state === 'logged_in' ? 'ok' : 'error',
+        );
       } else {
         await api.newcamdDisconnect(id);
         toast('Conexión cerrada', 'ok');
@@ -217,6 +319,7 @@ async function onRowClick(event) {
     }
     return;
   }
+
   if (action === 'test') {
     setBusy(button, true, 'Probando…');
     try {
@@ -232,16 +335,15 @@ async function onRowClick(event) {
 }
 
 async function connectAll() {
+  const pendientes = accounts.filter((item) => item.enabled && (item.status || {}).state !== 'logged_in');
+  if (!pendientes.length) {
+    toast('No hay cuentas activas pendientes de conectar', 'info');
+    return;
+  }
+  const button = byId('newcamd-connect-all');
+  setBusy(button, true, 'Conectando…');
+  let ok = 0;
   try {
-    const data = await api.newcamdAccounts();
-    const pendientes = (data.items || []).filter(
-      (item) => item.enabled && item.status && item.status.state !== 'logged_in'
-    );
-    if (!pendientes.length) {
-      toast('No hay cuentas pendientes de conectar', 'info');
-      return;
-    }
-    let ok = 0;
     for (const item of pendientes) {
       try {
         await api.newcamdConnect(item.id);
@@ -251,51 +353,54 @@ async function connectAll() {
       }
     }
     toast(`${ok}/${pendientes.length} cuentas conectadas`, ok ? 'ok' : 'error');
+  } finally {
+    setBusy(button, false);
     await load({ quiet: true });
-  } catch (error) {
-    toast(error.detail || 'Error', 'error');
   }
 }
 
 async function disconnectAll() {
+  const conectadas = accounts.filter((item) => (item.status || {}).state === 'logged_in');
+  if (!conectadas.length) {
+    toast('No hay cuentas conectadas', 'info');
+    return;
+  }
+  const button = byId('newcamd-disconnect-all');
+  setBusy(button, true, 'Cerrando…');
   try {
-    const data = await api.newcamdAccounts();
-    for (const item of data.items || []) {
-      if (item.status && item.status.state === 'logged_in') {
-        try {
-          await api.newcamdDisconnect(item.id);
-        } catch (_) {
-          /* continuar */
-        }
+    for (const item of conectadas) {
+      try {
+        await api.newcamdDisconnect(item.id);
+      } catch (_) {
+        /* continuar */
       }
     }
     toast('Conexiones cerradas', 'ok');
+  } finally {
+    setBusy(button, false);
     await load({ quiet: true });
-  } catch (error) {
-    toast(error.detail || 'Error', 'error');
   }
 }
 
+// ---------------------------------------------------------------------------
+// Ciclo de vida
+// ---------------------------------------------------------------------------
 export function init() {
-  const newButton = byId('newcamd-new');
-  if (newButton) newButton.addEventListener('click', () => openForm(null));
-  const refresh = byId('newcamd-refresh');
-  if (refresh) refresh.addEventListener('click', () => load());
-  const connectAllButton = byId('newcamd-connect-all');
-  if (connectAllButton) connectAllButton.addEventListener('click', connectAll);
-  const disconnectAllButton = byId('newcamd-disconnect-all');
-  if (disconnectAllButton) disconnectAllButton.addEventListener('click', disconnectAll);
-  const form = byId('newcamd-form');
-  if (form) form.addEventListener('submit', submit);
-  const test = byId('nc-test');
-  if (test) test.addEventListener('click', testForm);
-  const cancel = byId('nc-cancel');
-  if (cancel) cancel.addEventListener('click', closeForm);
-  const tbody = byId('newcamd-rows');
-  if (tbody) tbody.addEventListener('click', onRowClick);
+  const bind = (id, event, handler) => {
+    const node = byId(id);
+    if (node) node.addEventListener(event, handler);
+  };
+  bind('newcamd-new', 'click', () => openEditor(null));
+  bind('newcamd-refresh', 'click', () => load());
+  bind('newcamd-connect-all', 'click', connectAll);
+  bind('newcamd-disconnect-all', 'click', disconnectAll);
+  bind('newcamd-form', 'submit', submit);
+  bind('nc-test', 'click', testForm);
+  bind('nc-cancel', 'click', closeEditor);
+  bind('newcamd-rows', 'click', onRowClick);
 
   load();
-  // Refresco periódico del estado (ECM/CW cambian en vivo).
+  // Estado en vivo (ECM/CW y conexiones) mientras la vista está visible.
   refreshTimer = window.setInterval(() => {
     const view = document.querySelector('section[data-view="newcamd"]');
     if (view && !view.hidden) load({ quiet: true });
@@ -307,7 +412,7 @@ export function deactivate() {
     window.clearInterval(refreshTimer);
     refreshTimer = null;
   }
-  closeForm();
+  closeEditor();
 }
 
 export default { init, deactivate };
