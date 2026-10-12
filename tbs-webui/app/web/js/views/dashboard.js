@@ -193,16 +193,104 @@ export function init(ctx) {
   renderTuned(store.state.tuned);
   if (store.state.stats) renderStats(store.state.stats, store.state.source, null);
 
+  // --- Sintonizadores en uso (bloqueados por su transponder) -------------
+  let tunersTimer = null;
+
+  function barra(etiqueta, valor, unidad, clase) {
+    const numero = valor === null || valor === undefined ? null : Number(valor);
+    const ancho = numero === null ? 0 : Math.max(0, Math.min(100, numero));
+    const texto =
+      numero === null ? '—' : clase === 'quality' ? `${numero.toFixed(1)} ${unidad}` : `${numero.toFixed(1)} ${unidad}`;
+    return `<div class="bar-block">
+      <div class="bar-head"><span class="bar-label">${etiqueta}</span><span class="bar-value">${texto}</span></div>
+      <div class="bar"><div class="bar-fill bar-fill-${clase}" style="width:${ancho}%"></div></div>
+    </div>`;
+  }
+
+  function renderTuners(data) {
+    const host = byId('tuners-grid');
+    if (!host) return;
+    const lista = (data && data.tuners) || [];
+    setText('tuners-count', `${lista.length} en uso`);
+    if (!lista.length) {
+      host.innerHTML = '<p class="muted">Ningún sintonizador en uso. Sintoniza algo y aparecerá aquí bloqueado.</p>';
+      return;
+    }
+    host.innerHTML = lista
+      .map((tuner) => {
+        const tp = tuner.transponder || {};
+        const sig = tuner.signal || {};
+        const estado = sig.locked ? 'CON LOCK' : 'SIN LOCK';
+        const clase = sig.locked ? 'is-locked' : 'is-unlocked';
+        const etiqueta = `${tp.frequency_mhz ?? '—'} MHz ${tp.polarization ?? ''} ${
+          tp.symbol_rate_ksps ?? ''
+        } ksps ${tp.delivery_system ?? ''}`;
+        const segundos = tuner.in_use_seconds ? Math.round(tuner.in_use_seconds) : 0;
+        return `<div class="tuner-card">
+          <div class="tuner-head">
+            <strong>adapter${tuner.adapter}/frontend${tuner.frontend}</strong>
+            <span class="lock-badge ${clase}">${estado}</span>
+          </div>
+          <div class="tuner-transponder mono">${etiqueta}</div>
+          <div class="tuner-meta muted small">
+            bloqueado por <strong>${tuner.owner || '—'}</strong> · ${segundos} s · señal ${sig.signal_percent ?? '—'} % ·
+            SNR ${sig.snr_db ?? '—'} dB
+          </div>
+          ${barra('Señal', sig.signal_percent, '%', 'signal')}
+          ${barra('SNR', sig.snr_db, 'dB', 'quality')}
+          <div class="tuner-actions">
+            <button type="button" class="btn btn-ghost btn-sm" data-release="${tuner.adapter}:${tuner.frontend}">
+              Liberar este sintonizador
+            </button>
+            <span class="muted small">BER ${sig.ber ?? '—'}</span>
+          </div>
+        </div>`;
+      })
+      .join('');
+  }
+
+  async function loadTuners() {
+    try {
+      renderTuners(await api.tuners());
+    } catch (_) {
+      /* el sondeo no debe molestar */
+    }
+  }
+
+  const grid = byId('tuners-grid');
+  if (grid) {
+    grid.addEventListener('click', async (event) => {
+      const boton = event.target.closest('button[data-release]');
+      if (!boton) return;
+      const [adapter, frontend] = boton.dataset.release.split(':');
+      try {
+        await api.releaseTuner(Number(adapter), Number(frontend));
+        toast('Sintonizador liberado', 'ok');
+      } catch (error) {
+        toast(error.detail || 'No se pudo liberar', 'error');
+      }
+      await loadTuners();
+    });
+  }
+
+  loadTuners();
+  tunersTimer = window.setInterval(() => {
+    const vista = document.querySelector('section[data-view="dashboard"]');
+    if (vista && !vista.hidden) loadTuners();
+  }, 1000);
+
   return {
     activate() {
       if (chart) {
         chart.resize();
         chart.render();
       }
+      loadTuners();
     },
     deactivate() {},
     destroy() {
       if (chart) chart.destroy();
+      if (tunersTimer) window.clearInterval(tunersTimer);
     },
     chart: chart,
   };

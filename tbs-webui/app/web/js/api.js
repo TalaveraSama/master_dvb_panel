@@ -259,6 +259,9 @@ export const api = {
   deleteChannels: (ids) =>
     request('/channels', { method: 'DELETE', query: { ids: (ids || []).join(',') } }),
   deleteAllChannels: () => request('/channels', { method: 'DELETE', body: { all: true } }),
+  tuners: () => request('/tuners'),
+  releaseTuner: (adapter, frontend) =>
+    request('/tuners/' + adapter + '/' + frontend + '/release', { method: 'POST' }),
   newcamdOscam: (force) => request('/newcamd/oscam', { query: force ? { force: true } : undefined }),
   transponders: (query, opts) => request('/transponders', Object.assign({ query: query }, opts)),
   transponder: (id) => request('/transponders/' + id),

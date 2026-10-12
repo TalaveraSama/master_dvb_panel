@@ -291,6 +291,20 @@ def client(app):
 
 
 @pytest.fixture()
+def device_manager(app):
+    """Gestor de dispositivo de la app en pruebas (modo simulación)."""
+    from app.config import get_settings
+    from app.services.device_manager import DeviceManager
+
+    manager = DeviceManager(get_settings())
+    yield manager
+    try:
+        manager.release()
+    except Exception:  # pragma: no cover - cierre defensivo en tests
+        pass
+
+
+@pytest.fixture()
 def admin_client(client):
     """Cliente autenticado como administrador, con cabecera CSRF lista."""
     response = client.post(

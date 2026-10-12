@@ -537,12 +537,19 @@ class ScanService:
                 message=f"Puerto {port_index}/{total_ports}: adapter{adapter}/frontend{frontend}",
             )
             self._log.add(f"Solicitando hardware (adaptador {adapter}, frontend {frontend})")
+            # El escaneo ya libero el frontend en start() (si estaba sintonizado),
+            # asi que cualquier reserva previa de este puerto es obsoleta.
+            previo = self.device.tuners.owner_of(adapter, frontend)
+            if previo:
+                self.device.tuners.release(adapter, frontend)
+                logger.debug("Reserva previa de adapter%s/frontend%s de '%s' liberada", adapter, frontend, previo)
             if not device_lock.acquire(owner, timeout=self.settings.device_lock_timeout):
                 raise DeviceBusyError(
                     f"El dispositivo está ocupado por '{device_lock.owner}'. "
                     "Detén la sintonización o espera a que termine."
                 )
             acquired = True
+            self.device.tuners.claim(adapter, frontend, owner)
 
             fe = registry.open_frontend(adapter, frontend)
             fe.open()
@@ -647,6 +654,8 @@ class ScanService:
                     fe.close()
                 except Exception:
                     logger.debug("Error cerrando el frontend tras el escaneo", exc_info=True)
+            # Se libera la reserva del puerto para que otro pueda usarlo
+            self.device.tuners.release(adapter, frontend, owner)
             if acquired:
                 device_lock.release(owner)
 

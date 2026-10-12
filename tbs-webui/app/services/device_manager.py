@@ -32,6 +32,8 @@ from ..dvb.types import (
 
 logger = logging.getLogger(__name__)
 
+from .tuner_registry import TunerRegistry  # noqa: E402  (importa stats_to_dict de este modulo)
+
 # Etiquetas legibles de los bits de FE_READ_STATUS
 LOCK_FLAG_LABELS = {
     "signal": "Señal",
@@ -52,6 +54,9 @@ class DeviceManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._lock = threading.RLock()
+        # Registro de puertos de sintonizador: bloqueo exclusivo por puerto y
+        # niveles en vivo de cada transponder en uso (cuadro de mando).
+        self.tuners = TunerRegistry(history_seconds=float(settings.history_seconds))
         self._frontend = None  # dvb.base.Frontend | None
         self._frontend_key: tuple[int, int] | None = None
         self._tuned: TuneParams | None = None
@@ -128,25 +133,37 @@ class DeviceManager:
     def tune(self, params: TuneParams, owner: str = "api") -> SignalStats:
         """Sintoniza y devuelve las estadísticas tras esperar el lock.
 
-        Lanza `DeviceBusyError` si otro proceso/operación posee el hardware.
+        El puerto (`adapterN/frontendM`) queda **reservado en exclusiva** para ese
+        transponder: si otro proceso intenta usarlo, `TunerBusyError`.
         """
+        # 1) El puerto no puede estar en uso por otro propietario
+        if self.tuners.is_busy(params.adapter, params.frontend, owner):
+            actual = self.tuners.owner_of(params.adapter, params.frontend)
+            raise DeviceBusyError(
+                f"El sintonizador adapter{params.adapter}/frontend{params.frontend} está en uso "
+                f"por '{actual}' con otro transponder. Libéralo primero."
+            )
+
         device_lock = registry.get_lock()
         if not device_lock.acquire(owner, timeout=self.settings.device_lock_timeout):
             raise DeviceBusyError(
                 f"El dispositivo está ocupado por '{device_lock.owner}'. "
                 "Espera o detén la operación en curso."
             )
+        # 2) Se reclama el puerto antes de tocar el hardware
+        self.tuners.claim(params.adapter, params.frontend, owner)
         try:
             frontend = self._ensure_frontend(params.adapter, params.frontend)
             self._apply_switching(frontend, params)
             logger.info(
-                "Sintonizando %s %d kHz (IF %d kHz) SR=%s pol=%s adapter=%d",
+                "Sintonizando %s %d kHz (IF %d kHz) SR=%s pol=%s adapter=%d [owner=%s]",
                 params.delivery_system,
                 params.frequency_khz,
                 params.if_frequency_khz,
                 params.symbol_rate_ksps,
                 params.polarization,
                 params.adapter,
+                owner,
             )
             # La capa DVB decide si la frecuencia que recibe es la del transponder
             # o la intermedia: le pasamos el TuneParams tal cual, ya que
@@ -159,14 +176,18 @@ class DeviceManager:
                 self._stats = stats
                 self._last_error = stats.error
             self._push_history(stats)
+            self.tuners.mark_tuned(params, owner)
+            self.tuners.update_stats(params.adapter, params.frontend, stats)
             self._ensure_monitor()
             return stats
         except DeviceBusyError:
+            self.tuners.release(params.adapter, params.frontend, owner)
             raise
         except FrontendError as exc:
             self._last_error = str(exc)
             with self._lock:
                 self._tuned = params
+            self.tuners.release(params.adapter, params.frontend, owner)
             raise
         finally:
             # El lock se libera tras sintonizar: el frontend queda abierto y el
@@ -179,9 +200,12 @@ class DeviceManager:
         with self._lock:
             frontend, self._frontend = self._frontend, None
             self._frontend_key = None
-            self._tuned = None
+            tuned, self._tuned = self._tuned, None
             self._stats = None
             self._history.clear()
+        # Se libera la reserva del puerto para que otro pueda usarlo
+        if tuned is not None:
+            self.tuners.release(tuned.adapter, tuned.frontend)
         if frontend is not None:
             try:
                 frontend.close()
@@ -323,7 +347,14 @@ class DeviceManager:
             stats = self._read_stats_safe(frontend)
             with self._lock:
                 self._stats = stats
+                tuned = self._tuned
             self._push_history(stats)
+            # Niveles en vivo del puerto en uso (los pinta el cuadro de mando)
+            if tuned is not None:
+                try:
+                    self.tuners.update_stats(tuned.adapter, tuned.frontend, stats)
+                except Exception:  # pragma: no cover - no debe parar el monitor
+                    logger.debug("No se guardaron los niveles del sintonizador", exc_info=True)
             self._monitor_stop.wait(max(0.05, poll_ms / 1000.0))
         logger.debug("Monitor de señal detenido")
 
