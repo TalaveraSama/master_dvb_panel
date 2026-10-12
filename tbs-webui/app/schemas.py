@@ -420,6 +420,7 @@ class ServiceOut(BaseModel):
     created_at: datetime
     custom_name: str | None = None
     display_name: str
+    cam_name: str | None = None
 
 
 class ChannelListOut(BaseModel):
@@ -622,6 +623,8 @@ class NewcamdAccountIn(BaseModel):
     deskey: str = Field(default=DESKEY_DEFAULT, min_length=28, max_length=32)
     enabled: bool = True
     auto_connect: bool = False
+    timeout_s: int = Field(default=8, ge=1, le=60, description="Timeout de respuesta del servidor Newcamd")
+    disable_emm: bool = Field(default=True, description="Con True no se envian EMM; solo ECM")
     notes: str | None = Field(default=None, max_length=500)
 
     @field_validator("deskey")

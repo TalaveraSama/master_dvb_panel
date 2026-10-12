@@ -112,6 +112,7 @@ def service_to_out(
             sat_position=getattr(parent, "sat_position", None) if parent is not None else None,
             created_at=service.created_at,
             custom_name=service.custom_name,
+            cam_name=getattr(service, "cam_name", None),
             display_name=service.display_name,
         )
 

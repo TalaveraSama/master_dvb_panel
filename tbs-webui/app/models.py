@@ -171,6 +171,9 @@ class Service(Base):
     audio_pids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     video_pids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     ca_system_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    # Perfil Newcamd (softcam) asignado a este canal; el motor nativo lo usa
+    # para pedir el ECM. NULL = sin CAM.
+    cam_name: Mapped[str | None] = mapped_column(String(48), nullable=True, index=True)
     source: Mapped[str] = mapped_column(String(16), default="scan", nullable=False)  # scan | manual
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)

@@ -589,3 +589,87 @@ def delete_profile(account_id: int, db: DbSession) -> OkOut:
     db.commit()
     return OkOut(ok=True, detail=f"Perfil '{row.name}' borrado")
 
+
+
+# ===========================================================================
+# Asignacion de un perfil (softcam) a cada canal escaneado
+# Modelo portado del panel anterior: el motor recibe la opcion `cam` en la
+# entrada DVB del canal, con el bloque newcamd del perfil.
+# ===========================================================================
+
+
+@router.put("/services/{service_id}/cam", response_model=dict)
+def assign_cam_to_service(
+    service_id: int,
+    payload: dict,
+    db: DbSession,
+    settings: AppSettings,
+) -> dict:
+    """Asigna (o quita, con `cam_name: null`) un perfil Newcamd a un canal.
+
+    Guarda el nombre del perfil en el canal y devuelve el bloque `cam` que el
+    motor nativo usara en la entrada DVB (`dvb://tuner#pnr=101&cam=perfil`).
+    """
+    from ..models import Service
+
+    fila = db.get(Service, service_id)
+    if fila is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Canal no encontrado")
+
+    nombre = payload.get("cam_name")
+    if nombre in (None, "", "none", "__none"):
+        fila.cam_name = None
+        db.commit()
+        return {"ok": True, "service_id": service_id, "cam": None, "detail": "CAM quitado del canal"}
+
+    if not isinstance(nombre, str) or not perfiles.PROFILE_NAME.fullmatch(nombre):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nombre de perfil invalido",
+        )
+
+    row = db.execute(
+        select(NewcamdAccountModel).where(NewcamdAccountModel.name == nombre)
+    ).scalars().first()
+    if row is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Ese perfil no existe")
+
+    perfil = _profile_from_row(row, settings)
+    try:
+        perfil.validate()
+    except perfiles.ProfileError as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    fila.cam_name = perfil.name
+    db.commit()
+    return {
+        "ok": True,
+        "service_id": service_id,
+        "cam": perfiles.cam_block(perfil),
+        "dvb_url": f"dvb://tuner_1#pnr={fila.service_id}&cam={perfil.name}",
+        "detail": f"Perfil '{perfil.name}' asignado al canal",
+    }
+
+
+@router.get("/services/cam", response_model=dict)
+def services_with_cam(db: DbSession) -> dict:
+    """Canales con perfil Newcamd asignado (para la vista de canales)."""
+    from ..models import Service
+
+    filas = db.execute(
+        select(Service).where(Service.cam_name.isnot(None)).order_by(Service.name)
+    ).scalars().all()
+    return {
+        "total": len(filas),
+        "items": [
+            {
+                "id": fila.id,
+                "name": fila.custom_name or fila.name,
+                "service_id": fila.service_id,
+                "cam_name": fila.cam_name,
+                "scrambled": bool(fila.scrambled),
+                "is_fta": bool(fila.is_fta),
+            }
+            for fila in filas
+        ],
+    }
