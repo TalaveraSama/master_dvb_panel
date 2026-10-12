@@ -506,6 +506,121 @@ class HealthOut(BaseModel):
     adapters: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Newcamd (card sharing propio o autorizado)
+# ---------------------------------------------------------------------------
+DESKEY_DEFAULT = "0102030405060708091011121314"
+
+
+class NewcamdStatusOut(BaseModel):
+    state: str = "disconnected"
+    message: str = ""
+    connected_at: float | None = None
+    last_error: str | None = None
+    ecm_sent: int = 0
+    cw_received: int = 0
+    last_ecm_at: float | None = None
+    last_cw_at: float | None = None
+    last_cw: str | None = None
+    bytes_in: int = 0
+    bytes_out: int = 0
+
+
+class NewcamdAccountOut(BaseModel):
+    id: int
+    name: str
+    host: str
+    port: int
+    username: str
+    password_set: bool = False
+    deskey: str = DESKEY_DEFAULT
+    enabled: bool = True
+    auto_connect: bool = False
+    notes: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+    status: NewcamdStatusOut = Field(default_factory=NewcamdStatusOut)
+
+
+class NewcamdListOut(BaseModel):
+    total: int
+    enabled: bool = True
+    items: list[NewcamdAccountOut] = Field(default_factory=list)
+
+
+class NewcamdAccountIn(BaseModel):
+    """Alta o edición de una cuenta Newcamd. `password` vacío = no cambiar."""
+
+    name: str = Field(min_length=1, max_length=64)
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=50001, ge=1, le=65535)
+    username: str = Field(default="", max_length=64)
+    password: str | None = Field(default=None, max_length=128)
+    deskey: str = Field(default=DESKEY_DEFAULT, min_length=28, max_length=32)
+    enabled: bool = True
+    auto_connect: bool = False
+    notes: str | None = Field(default=None, max_length=500)
+
+    @field_validator("deskey")
+    @classmethod
+    def _valid_deskey(cls, value: str) -> str:
+        cleaned = value.strip().replace(" ", "").replace(":", "").lower()
+        if len(cleaned) != 28:
+            raise ValueError("La deskey debe tener 28 dígitos hexadecimales (14 bytes)")
+        try:
+            bytes.fromhex(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"deskey no válida: {exc}") from exc
+        return cleaned
+
+    @field_validator("host")
+    @classmethod
+    def _clean_host(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or any(ch.isspace() for ch in cleaned):
+            raise ValueError("Host no válido")
+        return cleaned
+
+
+class NewcamdTestIn(BaseModel):
+    """Prueba de conexión sin guardar (o de una cuenta ya guardada por id)."""
+
+    id: int | None = None
+    host: str | None = None
+    port: int = Field(default=50001, ge=1, le=65535)
+    username: str = ""
+    password: str | None = None
+    deskey: str = DESKEY_DEFAULT
+
+
+class NewcamdTestOut(BaseModel):
+    ok: bool
+    state: str
+    message: str
+    connected_at: float | None = None
+    details: NewcamdStatusOut | None = None
+
+
+class NewcamdActionOut(BaseModel):
+    ok: bool
+    id: int
+    status: NewcamdStatusOut
+
+
+class NewcamdEcmIn(BaseModel):
+    """Envío manual de un ECM (diagnóstico)."""
+
+    ecm_hex: str = Field(min_length=6, max_length=2048)
+    service_id: int = Field(default=0, ge=0, le=65535)
+
+
+class NewcamdEcmOut(BaseModel):
+    ok: bool
+    sent: bool
+    account_id: int
+    detail: str | None = None
+
+
 class LogEntryOut(BaseModel):
     ts: datetime
     level: str

@@ -58,6 +58,7 @@
           <li><a class="nav-link" href="#/tune" data-route="tune" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⌖</span> Sintonización</a></li>
           <li><a class="nav-link" href="#/scan" data-route="scan" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">≣</span> Escaneo</a></li>
           <li><a class="nav-link" href="#/channels" data-route="channels" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">☰</span> Canales</a></li>
+          <li><a class="nav-link" href="#/newcamd" data-route="newcamd" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">🔑</span> Newcamd</a></li>
           <li><a class="nav-link" href="#/transponders" data-route="transponders" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⌸</span> Transponders</a></li>
           <li><a class="nav-link" href="#/settings" data-route="settings" @click="navOpen = false"><span class="nav-ico" aria-hidden="true">⚙</span> Ajustes</a></li>
         </ul>
@@ -768,6 +769,95 @@
         </section>
 
       </main>
+
+      <!-- ================= NEWCAMD ================= -->
+      <section class="view" data-view="newcamd" aria-labelledby="h-newcamd" hidden>
+        <header class="view-head">
+          <h1 id="h-newcamd">Newcamd</h1>
+          <p class="muted">
+            Servidores Newcamd propios o autorizados (card sharing). Las contraseñas se guardan
+            cifradas y nunca se muestran.
+          </p>
+        </header>
+
+        <div id="newcamd-disabled" class="callout callout-warn" hidden>
+          Newcamd está deshabilitado en el servidor (TBS_NEWCAMD_ENABLED=0).
+        </div>
+
+        <article class="card">
+          <div class="card-head">
+            <h2>Cuentas</h2>
+            <div class="form-actions">
+              <button id="newcamd-new" type="button" class="btn btn-primary btn-sm">Nueva cuenta</button>
+              <button id="newcamd-refresh" type="button" class="btn btn-ghost btn-sm">Actualizar</button>
+              <button id="newcamd-connect-all" type="button" class="btn btn-ghost btn-sm">Conectar todas</button>
+              <button id="newcamd-disconnect-all" type="button" class="btn btn-ghost btn-sm">Desconectar todas</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Estado</th>
+                  <th>Nombre</th>
+                  <th>Servidor</th>
+                  <th>Usuario</th>
+                  <th>ECM/CW</th>
+                  <th class="col-actions">Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="newcamd-rows">
+                <tr><td colspan="6" class="muted">Cargando cuentas…</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <form id="newcamd-form" class="form-grid" hidden>
+            <div class="field">
+              <label for="nc-name">Nombre</label>
+              <input id="nc-name" type="text" maxlength="64" required placeholder="mi-servidor">
+            </div>
+            <div class="field">
+              <label for="nc-host">Servidor (host o IP)</label>
+              <input id="nc-host" type="text" maxlength="255" required placeholder="192.168.1.50">
+            </div>
+            <div class="field">
+              <label for="nc-port">Puerto</label>
+              <input id="nc-port" type="number" min="1" max="65535" value="50001">
+            </div>
+            <div class="field">
+              <label for="nc-user">Usuario</label>
+              <input id="nc-user" type="text" maxlength="64" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="nc-pass">Contraseña</label>
+              <input id="nc-pass" type="password" maxlength="128" autocomplete="new-password" placeholder="(sin cambios)">
+            </div>
+            <div class="field">
+              <label for="nc-deskey">Deskey (28 hex)</label>
+              <input id="nc-deskey" type="text" maxlength="32" value="0102030405060708091011121314">
+            </div>
+            <div class="field field-check">
+              <label class="check"><input id="nc-enabled" type="checkbox" checked><span>Habilitada</span></label>
+            </div>
+            <div class="field field-check">
+              <label class="check"><input id="nc-auto" type="checkbox"><span>Conectar al arrancar</span></label>
+            </div>
+            <div class="field field-wide">
+              <label for="nc-notes">Notas</label>
+              <input id="nc-notes" type="text" maxlength="500" placeholder="opcional">
+            </div>
+            <div class="form-actions field-wide">
+              <button id="nc-save" type="submit" class="btn btn-primary">Guardar</button>
+              <button id="nc-test" type="button" class="btn btn-ghost">Probar conexión</button>
+              <button id="nc-cancel" type="button" class="btn btn-ghost">Cancelar</button>
+              <span id="nc-result" class="muted small" role="status"></span>
+            </div>
+          </form>
+        </article>
+      </section>
+
     </div>
   </div>
 

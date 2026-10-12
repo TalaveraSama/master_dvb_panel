@@ -19,6 +19,9 @@ SQLAlchemy>=2.0,<3.0
 argon2-cffi>=23.1
 itsdangerous>=2.2
 
+# --- Newcamd (cifrado DES del protocolo y de las contraseñas guardadas) ---
+pycryptodome>=3.20
+
 # --- Utilidades del sistema DVB ---
 # El acceso a /dev/dvb usa ioctl vía stdlib (fcntl/struct); no se requieren
 # bindings externos. v4l-utils/dvb-tools se instalan por apt (ver install.sh).

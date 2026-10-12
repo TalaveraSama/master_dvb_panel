@@ -33,6 +33,7 @@ from .routers import (
     export,
     health,
     logs as logs_router,
+    newcamd as newcamd_router,
     scan,
     settings as settings_router,
     status as status_router,
@@ -40,6 +41,7 @@ from .routers import (
     ws,
 )
 from .services.device_manager import DeviceManager
+from .services.newcamd_manager import NewcamdManager
 from .services.scan_service import ScanService
 
 logger = logging.getLogger(__name__)
@@ -126,6 +128,7 @@ async def lifespan(app: FastAPI):
 
     app.state.device_manager = DeviceManager(settings)
     app.state.scan_service = ScanService(settings, app.state.device_manager)
+    app.state.newcamd_manager = NewcamdManager(settings)
     app.state.session_factory = get_sessionmaker()
 
     from .services import settings_service
@@ -142,6 +145,22 @@ async def lifespan(app: FastAPI):
     app.state.device_manager.set_history_seconds(
         int(stored.get("ui", {}).get("history_seconds", settings.history_seconds))
     )
+
+    # Newcamd: conexión automática de las cuentas marcadas (si está habilitado).
+    if settings.newcamd_enabled and settings.newcamd_auto_connect:
+        from .services import newcamd_manager as newcamd_module
+
+        session = get_sessionmaker()()
+        try:
+            rows = app.state.newcamd_manager.load_accounts(session)
+            for row in rows:
+                if row.enabled and row.auto_connect:
+                    try:
+                        app.state.newcamd_manager.connect(newcamd_module.to_domain(row, settings))
+                    except Exception as exc:
+                        logger.warning("Newcamd: no se pudo conectar '%s': %s", row.name, exc)
+        finally:
+            session.close()
 
     logger.info(
         "TBS WebUI %s listo — modo %s — escuchando en %s:%s",
@@ -163,6 +182,10 @@ async def lifespan(app: FastAPI):
             app.state.device_manager.stop()
         except Exception:  # pragma: no cover
             logger.exception("Error liberando el dispositivo")
+        try:
+            app.state.newcamd_manager.disconnect_all()
+        except Exception:  # pragma: no cover
+            logger.exception("Error cerrando las conexiones Newcamd")
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +223,7 @@ def create_app() -> FastAPI:
         export.router,
         settings_router.router,
         logs_router.router,
+        newcamd_router.router,
     ):
         app.include_router(router, prefix="/api", dependencies=AUTH_DEPENDENCY)
 
@@ -224,11 +248,12 @@ def create_app() -> FastAPI:
         response.headers.setdefault("Referrer-Policy", "same-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-        # CSP: todo local (sin CDNs). `style-src` necesita 'unsafe-inline' por los
-        # atributos style de Alpine; no hay recursos remotos de ningún tipo.
+        # CSP: todo local (sin CDNs). Alpine.js evalúa las expresiones de sus
+        # directivas con `new Function`, por lo que necesita 'unsafe-eval';
+        # `style-src` necesita 'unsafe-inline' por los atributos style de Alpine.
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; "
             "object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
         )

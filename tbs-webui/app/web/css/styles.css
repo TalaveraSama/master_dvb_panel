@@ -797,3 +797,15 @@ input[type="radio"] {
   .topbar, .sidenav, .toasts { display: none !important; }
   body { background: #fff; color: #000; }
 }
+
+/* --- Newcamd -------------------------------------------------------------- */
+.badge-ok { background: rgba(34, 197, 94, 0.16); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.45); }
+.badge-err { background: rgba(239, 68, 68, 0.16); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.45); }
+.badge-warn { background: rgba(234, 179, 8, 0.16); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.45); }
+.btn-danger { color: #f87171; border-color: rgba(239, 68, 68, 0.45); }
+.btn-danger:hover { background: rgba(239, 68, 68, 0.12); }
+#newcamd-form { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+.callout-warn { background: rgba(234, 179, 8, 0.10); border: 1px solid rgba(234, 179, 8, 0.4); }
+@media (max-width: 720px) {
+  #newcamd-rows td:nth-child(4), #newcamd-rows th:nth-child(4) { display: none; }
+}

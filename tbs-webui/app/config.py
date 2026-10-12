@@ -166,6 +166,17 @@ class Settings:
         self.lnb_high_khz = _as_int(get("LNB_HIGH_KHZ"), 10600)
         self.lnb_threshold_khz = _as_int(get("LNB_THRESHOLD_KHZ"), 11700)
 
+        # --- Newcamd (card sharing propio o autorizado) ---
+        self.newcamd_enabled = _as_bool(get("NEWCAMD_ENABLED"), True)
+        self.newcamd_timeout_s = max(1.0, _as_float(get("NEWCAMD_TIMEOUT_S"), 8.0))
+        self.newcamd_auto_connect = _as_bool(get("NEWCAMD_AUTO_CONNECT"), False)
+
+        # --- Transponder favorito (botón de sintonización rápida) ---
+        self.favourite_adapter = max(0, _as_int(get("FAVOURITE_ADAPTER"), 0))
+        self.favourite_frequency_khz = _as_int(get("FAVOURITE_FREQUENCY_KHZ"), 10970000)
+        self.favourite_symbol_rate_ksps = _as_int(get("FAVOURITE_SYMBOL_RATE_KSPS"), 27900)
+        self.favourite_polarization = str(get("FAVOURITE_POLARIZATION", "V") or "V").upper()[:1]
+
         self.log_level = str(get("LOG_LEVEL", "INFO") or "INFO").upper()
 
     # ------------------------------------------------------------------

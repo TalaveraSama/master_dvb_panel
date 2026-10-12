@@ -15,15 +15,17 @@ import * as dashboardView from './views/dashboard.js';
 import * as tuneView from './views/tune.js';
 import * as scanView from './views/scan.js';
 import * as channelsView from './views/channels.js';
+import * as newcamdView from './views/newcamd.js';
 import * as transpondersView from './views/transponders.js';
 import * as settingsView from './views/settings.js';
 
-const ROUTES = ['dashboard', 'tune', 'scan', 'channels', 'transponders', 'settings'];
+const ROUTES = ['dashboard', 'tune', 'scan', 'channels', 'newcamd', 'transponders', 'settings'];
 const TITLES = {
   dashboard: 'Panel',
   tune: 'Sintonización',
   scan: 'Escaneo',
   channels: 'Canales',
+  newcamd: 'Newcamd',
   transponders: 'Transponders',
   settings: 'Ajustes',
 };
@@ -269,6 +271,7 @@ async function boot() {
     tune: tuneView.init(ctx),
     scan: scanView.init(ctx),
     channels: channelsView.init(ctx),
+    newcamd: newcamdView.init(ctx),
     transponders: transpondersView.init(ctx),
     settings: settingsView.init(ctx),
   };

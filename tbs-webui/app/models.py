@@ -226,3 +226,31 @@ class AppLog(Base):
     level: Mapped[str] = mapped_column(String(16), default="INFO", nullable=False)
     source: Mapped[str] = mapped_column(String(32), default="app", nullable=False)
     message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+
+class NewcamdAccount(Base):
+    """Cuenta de un servidor Newcamd (card sharing propio o autorizado).
+
+    La contraseña se guarda **cifrada** con una clave derivada del secreto de la
+    aplicación; la API nunca la devuelve.
+    """
+
+    __tablename__ = "newcamd_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, default=50001, nullable=False)
+    username: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    password_enc: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    deskey: Mapped[str] = mapped_column(
+        String(32), default="0102030405060708091011121314", nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    auto_connect: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<NewcamdAccount {self.name} {self.host}:{self.port}>"

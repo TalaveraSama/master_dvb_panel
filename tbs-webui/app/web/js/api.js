@@ -269,6 +269,19 @@ export const api = {
   getSettings: () => request('/settings'),
   saveSettings: (payload) => request('/settings', { method: 'PUT', body: payload }),
   logs: (limit) => request('/logs', { query: { limit: limit } }),
+
+  // --- Newcamd (servidores propios o autorizados) ---------------------------
+  newcamdAccounts: () => request('/newcamd/accounts'),
+  newcamdCreate: (payload) => request('/newcamd/accounts', { method: 'POST', body: payload }),
+  newcamdUpdate: (id, payload) => request('/newcamd/accounts/' + id, { method: 'PUT', body: payload }),
+  newcamdDelete: (id) => request('/newcamd/accounts/' + id, { method: 'DELETE' }),
+  newcamdConnect: (id) => request('/newcamd/accounts/' + id + '/connect', { method: 'POST', timeoutMs: 30000 }),
+  newcamdDisconnect: (id) => request('/newcamd/accounts/' + id + '/disconnect', { method: 'POST' }),
+  newcamdStatus: (id) => request('/newcamd/accounts/' + id + '/status'),
+  newcamdAllStatus: () => request('/newcamd/status'),
+  newcamdTest: (payload) => request('/newcamd/test', { method: 'POST', body: payload, timeoutMs: 30000 }),
+  newcamdSendEcm: (id, payload) =>
+    request('/newcamd/accounts/' + id + '/ecm', { method: 'POST', body: payload }),
 };
 
 export default api;
