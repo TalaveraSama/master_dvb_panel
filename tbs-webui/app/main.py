@@ -282,6 +282,14 @@ def create_app() -> FastAPI:
             """SPA principal (el JS redirige a /login si no hay sesión)."""
             return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
+        @app.get("/v2", include_in_schema=False)
+        def index_fork() -> FileResponse:
+            """Vista con el aspecto del panel del fork astra-webui (misma API)."""
+            pagina = WEB_DIR / "index-fork.html"
+            if not pagina.is_file():
+                raise HTTPException(status_code=404, detail="Falta index-fork.html")
+            return FileResponse(pagina, headers={"Cache-Control": "no-store"})
+
         @app.get("/login", include_in_schema=False)
         def login_page() -> FileResponse:
             """Pantalla de login / asistente de primer arranque."""

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TBS WebUI</title>
+  <link rel="icon" href="/img/favicon.svg" type="image/svg+xml">
+  <!-- Aspecto del panel del fork astra-webui (GPLv3) -->
+  <link rel="stylesheet" href="/css/fork/cesbo.css">
+  <link rel="stylesheet" href="/css/fork/app.css">
+</head>
+<body>
+  <!-- ================= LOGIN ================= -->
+  <div class="login" id="login-screen">
+    <form class="login__card" id="login-form" autocomplete="on">
+      <div class="login__brand">
+        <img src="/img/brand.svg" alt="TBS WebUI" height="34">
+      </div>
+      <p class="login__subtitle">Panel de control del sintonizador DVB</p>
+      <div class="alert alert--error" id="login-error" hidden></div>
+      <div class="field">
+        <label class="field__label" for="login-user">Usuario</label>
+        <input class="input" id="login-user" name="username" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label class="field__label" for="login-pass">Contraseña</label>
+        <input class="input" id="login-pass" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn btn--primary btn--block" type="submit" id="login-submit">Entrar</button>
+      <p class="login__hint">Primer arranque: se crea el administrador con <code>TBS_ADMIN_PASSWORD</code>.</p>
+      <p class="login__version" id="login-version">v1.0.0</p>
+    </form>
+  </div>
+
+  <!-- ================= APLICACIÓN ================= -->
+  <div class="app" id="app" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar__brand">
+        <div class="row row--tight" style="align-items:center;gap:10px">
+          <img src="/img/brand.svg" alt="" height="26">
+          <div>
+            <div style="font-weight:650">TBS WebUI</div>
+            <div class="muted small" id="brand-sub">panel DVB</div>
+          </div>
+        </div>
+      </div>
+      <nav class="nav" id="nav" aria-label="Navegación"></nav>
+      <div class="sidebar__footer">
+        <div class="row row--tight" style="justify-content:space-between;align-items:center">
+          <span class="badge badge--info" id="conn-badge">conectando…</span>
+          <span class="badge badge--warn" id="mock-badge" hidden>simulación</span>
+        </div>
+        <div class="row row--tight" style="justify-content:space-between;align-items:center">
+          <span class="badge badge--brand" id="user-badge">—</span>
+          <button class="btn btn--ghost btn--sm" id="logout-btn" type="button">Salir</button>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="btn btn--ghost btn--icon" id="menu-btn" type="button" aria-label="Menú">☰</button>
+        <div class="topbar__titles">
+          <h1 class="topbar__title" id="view-title">Panel</h1>
+          <p class="topbar__subtitle" id="view-subtitle">Estado del receptor y señal en vivo</p>
+        </div>
+        <div class="topbar__right">
+          <span class="badge badge--info" id="lock-badge">—</span>
+          <span class="badge badge--brand" id="tuner-badge">—</span>
+        </div>
+      </header>
+      <main class="content" id="view" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="/js/forkskin.js"></script>
+</body>
+</html>
